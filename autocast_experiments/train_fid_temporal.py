@@ -11,7 +11,6 @@ from datasets import Dataset
 import pickle
 import pandas as pd
 import torch
-from torch._C import _LegacyVariableBase, _create_function_from_graph
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
@@ -72,28 +71,20 @@ def train(
         collate_fn=lambda data: data,
     )
 
-    loss_fn_tf = nn.BCELoss(reduction="none")
     loss_fn_LSM = nn.LogSoftmax(dim=-1)
     loss_fn_re = nn.MSELoss(reduction="none")
 
     model.train()
-    for epoch in range(opt.epochs):
-        epoch += 1
-        # train_dataloader.dataset.over_sample()  # in multihead we disable oversampling
-
+    for epoch in range(1, opt.epochs, 2): 
         curr_loss, curr_loss_tf, curr_loss_mc, curr_loss_re = 0.0, 0.0, 0.0, 0.0
         em_tf, em_mc, em_re = [], [], []
         exactmatch = []
         crowd_em_tf, crowd_em_mc, crowd_em_re = [], [], []
         crowd_exactmatch = []
         my_preds_tf, my_preds_mc, my_preds_re = [], [], []
-        my_predictions = []
         time0 = time.time()
-        for i, batch in enumerate(train_dataloader):
+        for batch in train_dataloader:
             step += 1
-
-            # logger.info(f"top of loop {int(time.time() - time0)} sec")
-            # time0 = time.time()
 
             fid_outputs_batch, targets_batch, true_labels_batch, cats_batch = (
                 [],
@@ -111,21 +102,12 @@ def train(
                 true_labels_batch.append(true_label)
                 cats_batch.append(cat)
 
-            # logger.info(f"get_fid_outputs {int(time.time() - time0)} sec")
-            # time0 = time.time()
-
             forecaster_outputs = forecaster_collate_fn(
                 fid_outputs_batch, targets_batch, true_labels_batch, cats_batch
             )
             X, mask, labels, true_labels, categories, seq_ends = forecaster_outputs
 
-            # logger.info(f"collate {int(time.time() - time0)} sec")
-            # time0 = time.time()
-
             hidden_state = model(X, mask=mask)  # (B, SEQ, FiD_H)
-
-            # logger.info(f"gpt forward {int(time.time() - time0)} sec")
-            # time0 = time.time()
 
             tf_logits = tf_classifier(hidden_state)[categories == 0, ...]
             tf_probs = F.softmax(tf_logits, dim=-1)[..., 0]
@@ -174,13 +156,7 @@ def train(
 
             train_loss = loss_tf + loss_mc + loss_re  # TODO: re-weigh?
 
-            # logger.info(f"compute loss {int(time.time() - time0)} sec")
-            # time0 = time.time()
-
             train_loss.backward()
-
-            # logger.info(f"loss backward {int(time.time() - time0)} sec")
-            # time0 = time.time()
 
             seq_ends_indices_tf = seq_ends[categories == 0].unsqueeze(-1)
             seq_ends_indices_mc = seq_ends[categories == 1].unsqueeze(-1)
@@ -244,17 +220,11 @@ def train(
             my_preds_mc.extend(preds_mc.detach().cpu().numpy())
             my_preds_re.extend(preds_re.detach().cpu().numpy())
 
-            # logger.info(f"compute metrics {int(time.time() - time0)} sec")
-            # time0 = time.time()
-
             if step % opt.accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(all_params, opt.clip)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-
-            # logger.info(f"optimizer step {int(time.time() - time0)} sec")
-            # time0 = time.time()
 
             train_loss = src.util.average_main(train_loss, opt)
             curr_loss += train_loss.item()
@@ -307,8 +277,6 @@ def train(
         if opt.is_main:
             if dev_em > best_dev_em:
                 best_dev_em = dev_em
-                # src.util.save(fid_model, optimizer, scheduler, step, best_dev_em,
-                #             opt, checkpoint_path, 'best_dev')
             log = f"{step} / {opt.total_steps} | "
             log += f"train: {curr_loss / len(train_dataloader):.3f}; {curr_loss_tf / len(train_dataloader):.3f} / \
             {curr_loss_mc / len(train_dataloader):.3f} / {curr_loss_re / len(train_dataloader):.3f} | "
@@ -362,7 +330,6 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     )
     model.eval()
 
-    loss_fn_tf = nn.BCELoss(reduction="none")
     loss_fn_LSM = nn.LogSoftmax(dim=-1)
     loss_fn_re = nn.MSELoss(reduction="none")
 
@@ -372,7 +339,6 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     crowd_em_tf, crowd_em_mc, crowd_em_re = [], [], []
     crowd_exactmatch = []
     my_preds_tf, my_preds_mc, my_preds_re = [], [], []
-    my_predictions = []
     time0 = time.time()
     device = torch.device("cpu")
     raw_logits = []
@@ -525,7 +491,6 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     # out-of-order overall stats
     crowd_exactmatch = crowd_em_tf + crowd_em_mc + crowd_em_re
     exactmatch = em_tf + em_mc + em_re
-    my_predictions = my_preds_tf + my_preds_mc + my_preds_re
 
     if not checkpoint_path.exists():
         checkpoint_path.mkdir()
@@ -707,9 +672,6 @@ def get_gpt(fid_hidden_size, gpt_hidden_size, opt, model_name="gpt2"):
         ]  # last hidden state, (presents), (all hidden_states), (attentions)
 
     GPT2Model.__call__ = gpt2_forward
-    # forecaster.parameters = lambda: model.parameters()
-    # forecaster.train = lambda: model.train()
-    # forecaster.eval = lambda: model.eval()
 
     tf_head = nn.Linear(gpt_hidden_size, 2)
     mc_head = nn.Linear(gpt_hidden_size, max_choices)

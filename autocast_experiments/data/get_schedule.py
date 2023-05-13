@@ -12,7 +12,6 @@ import json
 import os
 import argparse
 import pandas as pd
-import traceback
 from collections import defaultdict
 
 from beir.retrieval.evaluation import EvaluateRetrieval
