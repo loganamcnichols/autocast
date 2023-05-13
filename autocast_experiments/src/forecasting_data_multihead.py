@@ -92,19 +92,14 @@ class Collator(object):
         self.answer_maxlength = answer_maxlength
 
     def __call__(self, batch):
-        assert batch[0]["target"] != None
-        index = torch.tensor([ex["index"] for ex in batch])
-        targets = [ex["target"] for ex in batch]
-        labels = torch.tensor(targets).view(-1, 1)
-
-        def append_question(example):
-            if example["passages"] is None:
-                return [example["question"]]
-            return [example["question"] + " " + t for t in example["passages"]]
-
-        text_passages = [append_question(example) for example in batch]
+        labels = []
+        text_passages = []
+        for example in batch:
+            labels.append(example["target"])
+            passages = example["question"] + " " + example["passage"]
+            text_passages.append(passages.to_list())
+        labels = torch.tensor(labels).view(-1, 1)
         passage_ids, passage_masks = encode_passages(
             text_passages, self.tokenizer, self.text_maxlength
         )
-
-        return (index, labels, passage_ids, passage_masks)
+        return (labels, passage_ids, passage_masks)

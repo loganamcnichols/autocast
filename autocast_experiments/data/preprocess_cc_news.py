@@ -10,7 +10,6 @@ cc_news = load_dataset("cc_news", split="train")
 print("=== Loaded all articles", time.time() - time0)
 time0 = time.time()
 
-
 def strptime_flexible(date_string, format="%Y-%m-%d %H:%M:%S"):
     try:
         return dt.strptime(date_string, format)
