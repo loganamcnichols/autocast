@@ -75,7 +75,7 @@ def train(
     loss_fn_re = nn.MSELoss(reduction="none")
 
     model.train()
-    for epoch in range(1, opt.epochs, 2): 
+    for epoch in range(1, opt.epochs, 2):
         curr_loss, curr_loss_tf, curr_loss_mc, curr_loss_re = 0.0, 0.0, 0.0, 0.0
         em_tf, em_mc, em_re = [], [], []
         exactmatch = []

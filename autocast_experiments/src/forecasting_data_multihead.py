@@ -6,6 +6,7 @@
 
 import torch
 
+
 class FiDDataset(torch.utils.data.Dataset):
     def __init__(
         self,
