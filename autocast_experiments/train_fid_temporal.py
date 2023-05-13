@@ -7,8 +7,7 @@
 import json
 import os
 import time
-import sys
-import copy
+from datasets import Dataset
 import pickle
 import pandas as pd
 import torch
@@ -22,10 +21,7 @@ from pathlib import Path
 from torch.utils.data import (
     DataLoader,
     RandomSampler,
-    DistributedSampler,
     SequentialSampler,
-    dataloader,
-    MapDataPipe,
 )
 from src.options import Options
 
@@ -776,7 +772,6 @@ if __name__ == "__main__":
     options.add_forecaster_options()
     options.add_optim_options()
     opt = options.parse()
-    # opt = options.get_options(use_reader=True, use_optim=True)
 
     torch.manual_seed(opt.seed)
     src.slurm.init_distributed_mode(opt)
@@ -825,15 +820,6 @@ if __name__ == "__main__":
 
     model.reset_head_to_identity()  # get hidden state output instead of lm_logits
     model = model.cuda()
-
-    # use golbal rank and world size to split the eval set on multiple gpus
-    # train_examples = src.forecasting_data_multihead.load_data(
-    #     opt.train_data,
-    #     opt.n_context,
-    #     global_rank=opt.global_rank,
-    #     world_size=opt.world_size,
-    # )
-    from datasets import Dataset
 
     ccnews_path = os.path.join(script_dir, "data/cc_news")
     corpus = (
