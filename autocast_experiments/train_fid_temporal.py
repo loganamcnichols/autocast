@@ -58,13 +58,10 @@ def train(
             tb_logger = None
             logger.warning("Tensorboard is not available.")
 
-    torch.manual_seed(
-        opt.global_rank + opt.seed
-    )  # different seed for different sampling depending on global_rank
-    train_sampler = RandomSampler(train_dataset)
+    torch.manual_seed(opt.global_rank + opt.seed)
     train_dataloader = DataLoader(
         train_dataset,
-        sampler=train_sampler,
+        sampler=RandomSampler(train_dataset),
         batch_size=opt.per_gpu_batch_size,
         drop_last=False,
         num_workers=2,
@@ -85,13 +82,10 @@ def train(
         time0 = time.time()
         for batch in train_dataloader:
             step += 1
-
-            fid_outputs_batch, targets_batch, true_labels_batch, cats_batch = (
-                [],
-                [],
-                [],
-                [],
-            )
+            fid_outputs_batch = []
+            targets_batch = []
+            true_labels_batch = []
+            cats_batch = []
             for fid_dataset, targets, true_label, cat in batch:
                 fid_outputs = get_fid_outputs(
                     fid_model, fid_dataset, opt, fid_collator, mode="train"
@@ -813,7 +807,6 @@ if __name__ == "__main__":
         + list(mc_classifier.parameters())
         + list(regressor.parameters())
     )
-
     optimizer, scheduler = src.util.set_optim(opt, model, all_params)
 
     logger.info(f"TRAIN EXAMPLE {len(train_dataset)}")

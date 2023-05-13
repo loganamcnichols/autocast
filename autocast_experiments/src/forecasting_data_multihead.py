@@ -33,7 +33,6 @@ class FiDDataset(torch.utils.data.Dataset):
         elif question["qtype"] == "num":
             self.target = max_choices + 2
         # Format the question.
-
         self.question = question_prefix + " " + question["question"]
         if question["qtype"] == "mc":
             choices = question["choices"]
@@ -65,11 +64,9 @@ class FiDDataset(torch.utils.data.Dataset):
             "scores": scores,
         }
 
-
 def encode_passages(batch_text_passages, tokenizer, max_length):
     passage_ids, passage_masks = [], []
     for text_passages in batch_text_passages:
-        text_passages = [tp + " </s>" for tp in text_passages]
         p = tokenizer.batch_encode_plus(
             text_passages,
             max_length=max_length,
