@@ -4,11 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import time
-import sys
 import torch
 import pickle
-from torch._C import TensorType
 import torch.nn.functional as F
 import transformers
 import numpy as np
@@ -16,7 +13,6 @@ from pathlib import Path
 from torch.utils.data import (
     DataLoader,
     RandomSampler,
-    DistributedSampler,
     SequentialSampler,
 )
 from src.options import Options

@@ -4,9 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import pandas as pd
 import torch
-import json
 
 
 class FiDDataset(torch.utils.data.Dataset):
@@ -21,15 +19,21 @@ class FiDDataset(torch.utils.data.Dataset):
         passage_prefix="context:",
         choices_prefix="choices:",
         bound_prefix="bounds:",
-        max_choice_len=12,
+        max_choices=12,
         cat=None,
     ):
-        
-        self.answer = question["answer"]
-        self.choices = question["choices"]
-        self.qtype = question["qtype"]
+        self.research_schedule = research_schedule.sort_index(ascending=False)
+        self.research_material = research_material
+        self.n_context = n_context
 
+        if question["qtype"] == "mc":
+            self.target = question["answer"]
+        elif question["qtype"] == "t/f":
+            self.target = max_choices + question["answer"]
+        elif question["qtype"] == "num":
+            self.target = max_choices + 2
         # Format the question.
+
         self.question = question_prefix + " " + question["question"]
         if question["qtype"] == "mc":
             choices = question["choices"]
@@ -37,22 +41,12 @@ class FiDDataset(torch.utils.data.Dataset):
             choice_string = " | ".join(formatted_choices)
             self.question = f"{self.question} {choices_prefix} {choice_string}."
 
-        self.research_schedule = research_schedule.sort_index(ascending=False)
-        self.research_material = research_material
-        self.n_context = n_context
-        self.question_prefix = question_prefix
-        self.title_prefix = title_prefix
-        self.passage_prefix = passage_prefix
-        self.choices_prefix = choices_prefix
-        self.bound_prefix = bound_prefix
-        self.max_choice_len = max_choice_len
-
     def __len__(self):
         return len(self.research_schedule.index.unique())
 
     def __getitem__(self, index):
         date = self.research_schedule.index.unique()[index]
-        scores = self.research_schedule.loc[[date],:].set_index("doc_id")
+        scores = self.research_schedule.loc[[date], :].set_index("doc_id")
         docs = scores.join(self.research_material)
         docs = docs.sample(n=self.n_context, replace=True)
         scores = torch.tensor(docs["score"].to_numpy())
@@ -71,28 +65,10 @@ class FiDDataset(torch.utils.data.Dataset):
             "scores": scores,
         }
 
-    def sort_data(self):
-        if self.n_context is None or not "score" in self.data[0]["ctxs"][0]:
-            return
-        for ex in self.data:
-            ex["ctxs"].sort(key=lambda x: float(x["score"]), reverse=True)
-
-    def get_example(self, index):
-        return self.data[index]
-        return len(self.data)
-
-    def get_target(self):
-        if self.qtype == "mc":
-            return int(self.answer)
-        elif self.qtype == "t/f":
-            return self.max_choice_len + int(self.answer)
-        elif self.qtype == "num":
-            return self.max_choice_len + 2
-
 
 def encode_passages(batch_text_passages, tokenizer, max_length):
     passage_ids, passage_masks = [], []
-    for k, text_passages in enumerate(batch_text_passages):
+    for text_passages in batch_text_passages:
         text_passages = [tp + " </s>" for tp in text_passages]
         p = tokenizer.batch_encode_plus(
             text_passages,
@@ -134,27 +110,3 @@ class Collator(object):
         )
 
         return (index, labels, indices, lengths, passage_ids, passage_masks)
-
-
-def load_data(data_path=None, topn=1, global_rank=-1, world_size=-1):
-    assert data_path
-    if data_path.endswith(".jsonl"):
-        data = open(data_path, "r")
-    elif data_path.endswith(".json"):
-        with open(data_path, "r") as fin:
-            data = json.load(fin)
-
-    examples = []
-    for k, example in enumerate(data):
-        if global_rank > -1 and not k % world_size == global_rank:
-            continue
-        if data_path is not None and data_path.endswith(".jsonl"):
-            example = json.loads(example)
-
-        examples.append(example)
-
-    ## egrave: is this needed?
-    if data_path is not None and data_path.endswith(".jsonl"):
-        data.close()
-
-    return examples
