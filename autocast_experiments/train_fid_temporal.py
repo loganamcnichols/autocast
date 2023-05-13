@@ -4,10 +4,13 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+import os
 import time
 import sys
 import copy
 import pickle
+import pandas as pd
 import torch
 from torch._C import _LegacyVariableBase, _create_function_from_graph
 import torch.nn as nn
@@ -22,6 +25,7 @@ from torch.utils.data import (
     DistributedSampler,
     SequentialSampler,
     dataloader,
+    MapDataPipe,
 )
 from src.options import Options
 
@@ -33,6 +37,7 @@ import src.model
 
 # from transformers import TransformerWrapper, Decoder
 from transformers import GPT2Model
+import pandas as pd
 
 
 def identity_collate_fn(data):
@@ -531,7 +536,10 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     exactmatch = em_tf + em_mc + em_re
     my_predictions = my_preds_tf + my_preds_mc + my_preds_re
 
-    with open(checkpoint_path / f"results_epoch{epoch}.obj", "wb") as f:
+    if not checkpoint_path.exists():
+        checkpoint_path.mkdir()
+    outpath = checkpoint_path / f"results_epoch{epoch}.obj"
+    with open(outpath, "wb") as f:
         pickle.dump(raw_logits, f)
 
     if len(em_tf) == 0:
@@ -563,7 +571,7 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
 STR2BOOL = {"yes": 1, "Yes": 1, "no": 0, "No": 0}
 
 
-class ForecastingDataset(object):
+class ForecastingDataset:
     """
     Iterative predictions as sequence modeling
     where each token embeddings is replaced by
@@ -572,46 +580,26 @@ class ForecastingDataset(object):
 
     def __init__(
         self,
-        data,
+        questions: pd.DataFrame,
+        crowd,
+        schedule,
+        corpus,
         opt,
         max_seq_len=128,
         n_context=None,
-        over_sample=False,
         question_prefix="question:",
         title_prefix="title:",
         passage_prefix="context:",
         choices_prefix="choices:",
         bound_prefix="bounds:",
     ):
-        """
-        DATA SAMPLE:
-        {
-            "question_id": q_id,
-            "question": q,
-            "answers": q_answers,
-            "question_expiry": expiry,
-            "targets":[
-                {
-                    "date": index,
-                    "target": str(row["target"]),
-                    "ctxs": {
-                        "id": docs["id"][c],
-                        "title": docs["title"][c],
-                        "text": docs["text"][c],
-                        "score": str(score)
-                    }
-                }
-                for index, row in q_targets.iterrows()
-            ]
-        }
-        """
-        self.data = data
+        self.corpus = corpus.rename_axis("doc_id")
+        self.schedule = schedule
+        self.questions = questions.loc[schedule.keys(),:]
+        self.crowd = crowd
+        self.corpus = corpus
         self.opt = opt
         # adjust crowd to true targets
-        if self.opt.adjust_targets:
-            print("ADJUSTING TARGETS")
-        else:
-            print("KEEPING ORIGINAL TARGETS")
         self.max_seq_len = max_seq_len
         self.n_context = n_context
         self.question_prefix = question_prefix
@@ -621,150 +609,50 @@ class ForecastingDataset(object):
         self.bound_prefix = bound_prefix
         self.data_by_class_displayed = False
         self.data_by_class = {}
+        self.int_keys = [key for key in self.schedule]
 
         # self.pre_filter(over_sample)
 
-    def pre_filter(self, over_sample):
-        valid_data = []
-
-        for example in self.data:
-            for i, day in enumerate(example["targets"]):
-                if day["ctxs"]:  # we can use this example
-                    # # label = example['answers'][0]
-                    # label = 'yes' if float(example['targets'][-1]['target']) > 0.5 else 'no'
-                    # if label not in self.data_by_class:
-                    #     self.data_by_class[label] = []
-                    # self.data_by_class[label].append(example)
-                    valid_data.append(example)
-                    break
-        self.data = valid_data
-
-        if over_sample:
-            self.over_sample()
-
-    def over_sample(self):
-        max_count = 0
-        for label in self.data_by_class:
-            max_count = max(max_count, len(self.data_by_class[label]))
-        data = []
-        for label in self.data_by_class:
-            class_data = self.data_by_class[label]
-            data.extend(class_data)
-            class_count = len(class_data)
-            over_samples = np.random.choice(
-                class_data, max_count - class_count, replace=True
-            )
-            data.extend(over_samples)
-
-        self.data = data
-
     def __len__(self):
-        # if not self.data_by_class_displayed:
-        #     output_str = ''
-        #     for label in self.data_by_class:
-        #         output_str += f"{len(self.data_by_class[label])} {label} "
-        #     print("# samples by class:", output_str)
-        #     self.data_by_class_displayed = True
-        return len(self.data)
-
-    def get_category(self, example):
-        tf_choices = ["yes", "no", "Yes", "No"]
-        if isinstance(example["choices"], dict):
-            return 2
-        elif (
-            (
-                example["choices"][0] not in tf_choices
-                and example["choices"][1] not in tf_choices
-            )
-            or len(example["choices"]) > 2
-            or isinstance(example["targets"][0]["target"], list)
-        ):
-            return 1
-        else:
-            return 0
+        return len(self.schedule)
 
     def __getitem__(self, index):
-        example = self.data[index]
-        fid_examples = []
-        targets = []
-        cat = self.get_category(example)
-        length = min(len(example["choices"]), max_choice_len)
+        question_data = self.questions.iloc[index, :]
+        question_id = question_data.name
+        q_schedule = self.schedule.get(question_id)
+        q_crowd = self.crowd.get(question_id)
+        q_schedule = pd.DataFrame(q_schedule)
+        if "date" not in q_schedule.columns:
+            print("stop here")
+        q_schedule = q_schedule.set_index("date")
+        q_crowd = pd.DataFrame.from_dict(q_crowd, orient="index")
+        q_schedule.index = pd.to_datetime(q_schedule.index)
+        q_crowd.index = pd.to_datetime(q_crowd.index)
+        truncated_common_dates = q_crowd.index.intersection(
+            q_schedule.index
+        ).sort_values(ascending=False)[: self.max_seq_len]
+        q_schedule = q_schedule.loc[truncated_common_dates, :]
+        q_crowd = q_crowd.loc[truncated_common_dates, :]
+        research_materal = self.corpus.loc[q_schedule["doc_id"], :]
+        answer = question_data.get("answer")
+        qtype = question_data.get("qtype")
+        if qtype == "t/f":
+            code = 0
+        elif qtype == "mc":
+            code = 1
+        elif qtype == "num":
+            code = 2
 
-        if cat == 0:
-            true_target = STR2BOOL[example["answers"][0]]
-        elif cat == 2:
-            true_target = float(example["answers"][0])
-        elif cat == 1:
-            true_target = int(ord(example["answers"][0]) - ord("A"))
+        targets = torch.tensor(q_crowd.to_numpy())
 
-        has_ctxs = False
-        for i, day in enumerate(example["targets"]):
-            if not day["ctxs"]:  # if we don't have news articles
-                day["ctxs"] = []
-                continue
-
-            has_ctxs = True
-
-            if cat == 0 or cat == 2:
-                t = float(day["target"])
-                if self.opt.adjust_targets:
-                    t = (t + true_target) / 2
-                targets.append([t])
-            elif cat == 1:
-                targets_mc = [float(pred) for pred in day["target"][:length]]
-                total = sum(targets_mc)
-                t = [t / total for t in targets_mc]
-                if self.opt.adjust_targets:
-                    t = [
-                        (t[i] + 1) / 2 if i == true_target else t[i] / 2
-                        for i in range(len(t))
-                    ]
-                targets.append(t)
-
-            day_copy = copy.deepcopy(day)
-            day_copy["id"] = i
-            day_copy["question"] = example["question"]
-            day_copy["answers"] = example["answers"]  # TODO: use crowd as target?
-            day_copy["choices"] = example["choices"]
-            del day_copy["target"]
-            fid_examples.append(day_copy)
-
-        if not has_ctxs:
-            day_copy = copy.deepcopy(day)
-            day_copy["id"] = 0
-            day_copy["question"] = example["question"]
-            day_copy["answers"] = example["answers"]  # TODO: use crowd as target?
-            day_copy["choices"] = example["choices"]
-            del day_copy["target"]
-            if cat == 0 or cat == 2:
-                targets.append([float(true_target)])
-            elif cat == 1:
-                targets.append([float(i == true_target) for i in range(length)])
-            fid_examples.append(day_copy)
-
-        assert len(targets) == len(fid_examples)
-
-        fid_examples, targets = (
-            fid_examples[-self.max_seq_len :],
-            targets[-self.max_seq_len :],
-        )
-        targets = [torch.tensor(item) for item in targets]
-        targets = pad_sequence(
-            targets, batch_first=True, padding_value=-1.0
-        )  # pad the targets
-        targets_pad = torch.full((targets.size()[0], max_choice_len), -1.0)
-        targets_pad[: targets.size()[0], : targets.size()[1]] = targets
-
-        # truncated_label = example['tokenized_label'][-len(fid_examples):]
-        # truncated_input_id = example['tokenized_input_id'][-len(fid_examples):]
-        # truncated_input_mask = example['tokenized_input_mask'][-len(fid_examples):]
-        # for i, ex in enumerate(fid_examples):
-        #     ex['tokenized_label'] = truncated_label[i]
-        #     ex['tokenized_input_id'] = truncated_input_id[i]
-        #     ex['tokenized_input_mask'] = truncated_input_mask[i]
+        # Pad targets to be n x max_choice_len
+        targets_padded = torch.full((targets.size(0), max_choice_len), -1.0)
+        targets_padded[: targets.size(0), : targets.size(1)] = targets
 
         fid_dataset = src.forecasting_data_multihead.FiDDataset(
-            fid_examples,
+            question_data,
+            q_schedule,
+            research_materal,
             self.n_context,
             self.question_prefix,
             self.title_prefix,
@@ -772,10 +660,8 @@ class ForecastingDataset(object):
             self.choices_prefix,
             self.bound_prefix,
             max_choice_len,
-            cat,
         )
-
-        return fid_dataset, targets_pad, true_target, cat
+        return fid_dataset, targets_padded, answer, code
 
 
 def get_fid_outputs(model, dataset, opt, collator, mode):
@@ -843,24 +729,6 @@ def forecaster_collate_fn(examples, labels, true_labels, cats):
     return examples, mask, labels, true_labels, cats, seq_ends
 
 
-# def get_vanilla_transformer(fid_hidden_size, opt):
-#     model = TransformerWrapper(
-#         num_tokens = 1, # classification head
-#         max_seq_len = opt.max_seq_len,
-#         attn_layers = Decoder(
-#             dim = fid_hidden_size,
-#             depth = 12,
-#             heads = 8
-#         )
-#     )
-
-#     directly use hidden state features from FiD
-#     model.token_emb = nn.Linear(fid_hidden_size, fid_hidden_size)
-#     model = model.cuda()
-
-#     return model
-
-
 def get_gpt(fid_hidden_size, gpt_hidden_size, opt, model_name="gpt2"):
     from transformers import AutoConfig
 
@@ -914,18 +782,10 @@ if __name__ == "__main__":
     src.slurm.init_distributed_mode(opt)
     src.slurm.init_signal_handler()
 
-    checkpoint_path = Path(opt.checkpoint_dir) / opt.name
-    checkpoint_exists = checkpoint_path.exists()
-    if opt.is_distributed:
-        torch.distributed.barrier()
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
-    # if not checkpoint_exists and opt.is_main:
-    #    options.print_options(opt)
-    # checkpoint_path, checkpoint_exists = util.get_checkpoint_path(opt)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(script_dir, "run.log")
 
-    logger = src.util.init_logger(
-        opt.is_main, opt.is_distributed, checkpoint_path / "run.log"
-    )
+    logger = src.util.init_logger(opt.is_main, opt.is_distributed, log_path)
 
     model_name = "t5-" + opt.model_size
     model_class = src.model.FiDT5
@@ -936,27 +796,25 @@ if __name__ == "__main__":
         opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength
     )
 
-    if not checkpoint_exists and opt.model_path == "none":
+    
+    if opt.model_path:
+        checkpoint_path = Path(script_dir) / "checkpoint" / opt.model_path
+    else:
+        checkpoint_path = Path(script_dir) / "checkpoint" / "latest"
+
+    if checkpoint_path.exists():
+        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = src.util.load(
+            model_class, checkpoint_path, opt, reset_params=True
+        )
+        logger.info(f"Model loaded from {checkpoint_path}")
+    else:
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         model = src.model.FiDT5(t5.config)
         model.load_t5(t5.state_dict())
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_em = 0, 0.0
-    elif opt.model_path == "none":
-        load_path = checkpoint_path / "checkpoint" / "latest"
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = src.util.load(
-            model_class, load_path, opt, reset_params=False
-        )
-        logger.info(f"Model loaded from {load_path}")
-    else:
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = src.util.load(
-            model_class, opt.model_path, opt, reset_params=True
-        )
-        logger.info(f"Model loaded from {opt.model_path}")
-
-    model.set_checkpoint(opt.use_checkpoint)
-
+        
     if opt.is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -969,32 +827,62 @@ if __name__ == "__main__":
     model = model.cuda()
 
     # use golbal rank and world size to split the eval set on multiple gpus
-    train_examples = src.forecasting_data_multihead.load_data(
-        opt.train_data,
-        opt.n_context,
-        global_rank=opt.global_rank,
-        world_size=opt.world_size,
+    # train_examples = src.forecasting_data_multihead.load_data(
+    #     opt.train_data,
+    #     opt.n_context,
+    #     global_rank=opt.global_rank,
+    #     world_size=opt.world_size,
+    # )
+    from datasets import Dataset
+
+    ccnews_path = os.path.join(script_dir, "data/cc_news")
+    corpus = (
+        Dataset.load_from_disk(ccnews_path)
+        .to_pandas()
+        .set_index("id")
     )
+
+    train_questions_path = os.path.join(script_dir, opt.train_questions)
+    train_crowd_path = os.path.join(script_dir, opt.train_crowd)
+    train_schedule_path = os.path.join(script_dir, opt.train_schedule)
+    train_questions = pd.read_json(train_questions_path, orient="index")
+    with open(train_crowd_path, "r") as datafile:
+        train_crowd = json.load(datafile)
+    with open(train_schedule_path, "r") as datafile:
+        train_schedule = json.load(datafile)
+
     train_dataset = ForecastingDataset(
-        train_examples,
+        train_questions,
+        train_crowd,
+        train_schedule,
+        corpus,
         opt,
         max_seq_len=opt.max_seq_len,
         n_context=opt.n_context,
-        over_sample=False,
     )
     # use golbal rank and world size to split the eval set on multiple gpus
-    eval_examples = src.forecasting_data_multihead.load_data(
-        opt.eval_data,
-        opt.n_context,
-        global_rank=opt.global_rank,
-        world_size=opt.world_size,
-    )
+    # eval_examples = src.forecasting_data_multihead.load_data(
+    #     opt.eval_data,
+    #     opt.n_context,
+    #     global_rank=opt.global_rank,
+    #     world_size=opt.world_size,
+    # )
+    test_questions_path = os.path.join(script_dir, opt.test_questions)
+    test_crowd_path = os.path.join(script_dir, opt.test_crowd)
+    test_schedule_path = os.path.join(script_dir, opt.test_schedule)
+    test_questions = pd.read_json(test_questions_path, orient="index")
+    with open(test_crowd_path, "r") as datafile:
+        test_crowd = json.load(datafile)
+    with open(test_schedule_path, "r") as datafile:
+        test_schedule = json.load(datafile)
     eval_dataset = ForecastingDataset(
-        eval_examples,
+        test_questions,
+        test_crowd,
+        test_schedule,
+        corpus,
         opt,
         max_seq_len=opt.max_seq_len,
         n_context=opt.n_context,
-        over_sample=False,
     )
 
     # initialize forecaster here
