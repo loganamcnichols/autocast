@@ -95,8 +95,6 @@ class Collator(object):
         assert batch[0]["target"] != None
         index = torch.tensor([ex["index"] for ex in batch])
         targets = [ex["target"] for ex in batch]
-
-        indices, lengths = None, None
         labels = torch.tensor(targets).view(-1, 1)
 
         def append_question(example):
@@ -109,4 +107,4 @@ class Collator(object):
             text_passages, self.tokenizer, self.text_maxlength
         )
 
-        return (index, labels, indices, lengths, passage_ids, passage_masks)
+        return (index, labels, passage_ids, passage_masks)

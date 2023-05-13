@@ -619,7 +619,7 @@ def get_fid_outputs(model, dataset, opt, collator, mode):
 
     model.train(mode == "train")
     for i, batch in enumerate(dataloader):
-        (_, labels, _, _, context_ids, context_mask) = batch
+        (labels, context_ids, context_mask) = batch
 
         # TODO: we could pass in labels here too for additional training signal
         with torch.set_grad_enabled(mode == "train"):
