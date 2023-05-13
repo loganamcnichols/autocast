@@ -36,10 +36,6 @@ from transformers import GPT2Model
 import pandas as pd
 
 
-def identity_collate_fn(data):
-    return data
-
-
 def train(
     model,
     fid_model,
@@ -51,7 +47,6 @@ def train(
     eval_dataset,
     opt,
     fid_collator,
-    forecaster_collator,
     best_dev_em,
     checkpoint_path,
 ):
@@ -74,7 +69,7 @@ def train(
         batch_size=opt.per_gpu_batch_size,
         drop_last=False,
         num_workers=2,
-        collate_fn=identity_collate_fn,
+        collate_fn=lambda data: data,
     )
 
     loss_fn_tf = nn.BCELoss(reduction="none")
@@ -119,7 +114,7 @@ def train(
             # logger.info(f"get_fid_outputs {int(time.time() - time0)} sec")
             # time0 = time.time()
 
-            forecaster_outputs = forecaster_collator(
+            forecaster_outputs = forecaster_collate_fn(
                 fid_outputs_batch, targets_batch, true_labels_batch, cats_batch
             )
             X, mask, labels, true_labels, categories, seq_ends = forecaster_outputs
@@ -304,7 +299,7 @@ def train(
             fid_model,
             eval_dataset,
             fid_collator,
-            forecaster_collator,
+            forecaster_collate_fn,
             opt,
             epoch,
         )
@@ -363,7 +358,7 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
         batch_size=opt.per_gpu_batch_size * 4,
         drop_last=False,
         num_workers=2,
-        collate_fn=identity_collate_fn,
+        collate_fn=lambda data: data,
     )
     model.eval()
 
@@ -564,9 +559,6 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     return exactmatch, test_loss, np.mean(crowd_exactmatch) / 2
 
 
-STR2BOOL = {"yes": 1, "Yes": 1, "no": 0, "No": 0}
-
-
 class ForecastingDataset:
     """
     Iterative predictions as sequence modeling
@@ -576,7 +568,7 @@ class ForecastingDataset:
 
     def __init__(
         self,
-        questions: pd.DataFrame,
+        questions,
         crowd,
         schedule,
         corpus,
@@ -587,40 +579,28 @@ class ForecastingDataset:
         title_prefix="title:",
         passage_prefix="context:",
         choices_prefix="choices:",
-        bound_prefix="bounds:",
     ):
-        self.corpus = corpus.rename_axis("doc_id")
         self.schedule = schedule
-        self.questions = questions.loc[schedule.keys(),:]
+        self.questions = questions.loc[schedule.keys(), :]
         self.crowd = crowd
         self.corpus = corpus
         self.opt = opt
-        # adjust crowd to true targets
         self.max_seq_len = max_seq_len
         self.n_context = n_context
         self.question_prefix = question_prefix
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
         self.choices_prefix = choices_prefix
-        self.bound_prefix = bound_prefix
-        self.data_by_class_displayed = False
-        self.data_by_class = {}
-        self.int_keys = [key for key in self.schedule]
-
-        # self.pre_filter(over_sample)
 
     def __len__(self):
-        return len(self.schedule)
+        return len(self.questions)
 
     def __getitem__(self, index):
         question_data = self.questions.iloc[index, :]
         question_id = question_data.name
         q_schedule = self.schedule.get(question_id)
         q_crowd = self.crowd.get(question_id)
-        q_schedule = pd.DataFrame(q_schedule)
-        if "date" not in q_schedule.columns:
-            print("stop here")
-        q_schedule = q_schedule.set_index("date")
+        q_schedule = pd.DataFrame(q_schedule).set_index("date")
         q_crowd = pd.DataFrame.from_dict(q_crowd, orient="index")
         q_schedule.index = pd.to_datetime(q_schedule.index)
         q_crowd.index = pd.to_datetime(q_crowd.index)
@@ -642,7 +622,7 @@ class ForecastingDataset:
         targets = torch.tensor(q_crowd.to_numpy())
 
         # Pad targets to be n x max_choice_len
-        targets_padded = torch.full((targets.size(0), max_choice_len), -1.0)
+        targets_padded = torch.full((targets.size(0), max_choices), -1.0)
         targets_padded[: targets.size(0), : targets.size(1)] = targets
 
         fid_dataset = src.forecasting_data_multihead.FiDDataset(
@@ -654,8 +634,7 @@ class ForecastingDataset:
             self.title_prefix,
             self.passage_prefix,
             self.choices_prefix,
-            self.bound_prefix,
-            max_choice_len,
+            max_choices,
         )
         return fid_dataset, targets_padded, answer, code
 
@@ -665,9 +644,6 @@ def get_fid_outputs(model, dataset, opt, collator, mode):
     dataloader = DataLoader(
         dataset, sampler=sampler, batch_size=16, drop_last=False, collate_fn=collator
     )
-
-    # logger.info(f"get fid dataloader {float(time.time() - time0)} sec")
-    # time0 = time.time()
 
     outputs = []
 
@@ -680,9 +656,6 @@ def get_fid_outputs(model, dataset, opt, collator, mode):
     for i, batch in enumerate(dataloader):
         (_, labels, _, _, context_ids, context_mask) = batch
 
-        # logger.info(f"fid forward started {float(time.time() - time0)} sec")
-        # time0 = time.time()
-
         # TODO: we could pass in labels here too for additional training signal
         with torch.set_grad_enabled(mode == "train"):
             model_output = model(
@@ -694,15 +667,8 @@ def get_fid_outputs(model, dataset, opt, collator, mode):
         hidden_state = model_output[3][-1]
         outputs.append(hidden_state)
 
-        # logger.info(f"fid forward finished {float(time.time() - time0)} sec")
-        # time0 = time.time()
-
     outputs = torch.cat(outputs, dim=0)  # (n_examples, 1, hidden_size)
     outputs = outputs.view(outputs.shape[0], -1)  # (n_examples, hidden_size)
-
-    # TODO: we could add a linear layer here
-
-    # logger.info(f"get hidden from fid {float(time.time() - time0)} sec")
 
     if mode == "eval":
         outputs = outputs.detach()
@@ -721,7 +687,6 @@ def forecaster_collate_fn(examples, labels, true_labels, cats):
     true_labels = torch.tensor(true_labels, device=mask.device)
     cats = torch.tensor(cats, device=mask.device)
     assert examples.shape[:2] == mask.shape, (examples.shape[:2], mask.shape)
-
     return examples, mask, labels, true_labels, cats, seq_ends
 
 
@@ -729,13 +694,7 @@ def get_gpt(fid_hidden_size, gpt_hidden_size, opt, model_name="gpt2"):
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(model_name)
-
-    # model = GPT2Model.from_pretrained(model_name)
     model = GPT2Model(config)
-
-    # directly use hidden state features from FiD
-    # model.set_input_embeddings(nn.Linear(fid_hidden_size, gpt_hidden_size))
-    # model.lm_head = nn.Identity(gpt_hidden_size)  # nn.Identity()
     model = model.cuda()
 
     input_embeddings = nn.Linear(fid_hidden_size, gpt_hidden_size).cuda()
@@ -753,7 +712,7 @@ def get_gpt(fid_hidden_size, gpt_hidden_size, opt, model_name="gpt2"):
     # forecaster.eval = lambda: model.eval()
 
     tf_head = nn.Linear(gpt_hidden_size, 2)
-    mc_head = nn.Linear(gpt_hidden_size, max_choice_len)
+    mc_head = nn.Linear(gpt_hidden_size, max_choices)
     regressor_head = nn.Sequential(nn.Linear(gpt_hidden_size, 1), nn.Sigmoid())
 
     tf_head = tf_head.cuda()
@@ -764,7 +723,7 @@ def get_gpt(fid_hidden_size, gpt_hidden_size, opt, model_name="gpt2"):
 
 
 tf_classifier, mc_classifier, regressor = None, None, None
-max_choice_len = 12
+max_choices = 12
 
 if __name__ == "__main__":
     options = Options()
@@ -791,7 +750,6 @@ if __name__ == "__main__":
         opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength
     )
 
-    
     if opt.model_path:
         checkpoint_path = Path(script_dir) / "checkpoint" / opt.model_path
     else:
@@ -809,7 +767,7 @@ if __name__ == "__main__":
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_em = 0, 0.0
-        
+
     if opt.is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -821,16 +779,15 @@ if __name__ == "__main__":
     model.reset_head_to_identity()  # get hidden state output instead of lm_logits
     model = model.cuda()
 
+    # Load data sources.
     ccnews_path = os.path.join(script_dir, "data/cc_news")
-    corpus = (
-        Dataset.load_from_disk(ccnews_path)
-        .to_pandas()
-        .set_index("id")
-    )
+    corpus = Dataset.load_from_disk(ccnews_path).to_pandas().set_index("id")
 
+    # Load training data.
     train_questions_path = os.path.join(script_dir, opt.train_questions)
     train_crowd_path = os.path.join(script_dir, opt.train_crowd)
     train_schedule_path = os.path.join(script_dir, opt.train_schedule)
+
     train_questions = pd.read_json(train_questions_path, orient="index")
     with open(train_crowd_path, "r") as datafile:
         train_crowd = json.load(datafile)
@@ -846,21 +803,16 @@ if __name__ == "__main__":
         max_seq_len=opt.max_seq_len,
         n_context=opt.n_context,
     )
-    # use golbal rank and world size to split the eval set on multiple gpus
-    # eval_examples = src.forecasting_data_multihead.load_data(
-    #     opt.eval_data,
-    #     opt.n_context,
-    #     global_rank=opt.global_rank,
-    #     world_size=opt.world_size,
-    # )
     test_questions_path = os.path.join(script_dir, opt.test_questions)
     test_crowd_path = os.path.join(script_dir, opt.test_crowd)
     test_schedule_path = os.path.join(script_dir, opt.test_schedule)
+
     test_questions = pd.read_json(test_questions_path, orient="index")
     with open(test_crowd_path, "r") as datafile:
         test_crowd = json.load(datafile)
     with open(test_schedule_path, "r") as datafile:
         test_schedule = json.load(datafile)
+
     eval_dataset = ForecastingDataset(
         test_questions,
         test_crowd,
@@ -870,14 +822,6 @@ if __name__ == "__main__":
         max_seq_len=opt.max_seq_len,
         n_context=opt.n_context,
     )
-
-    # initialize forecaster here
-    # gpt_model_name = 'gpt2'
-    # if opt.model_size == 'base':
-    #     fid_hidden_size = 768
-    # elif opt.model_size == 'large':
-    #     fid_hidden_size = 1024
-    #     gpt_model_name += '-medium'
 
     gpt_model_name = "gpt2"
     if opt.model_size == "small":
@@ -908,11 +852,6 @@ if __name__ == "__main__":
         + list(regressor.parameters())
     )
 
-    #### NO GRADIENTS ####
-    # all_params = list(forecaster.parameters()) + list(input_embeddings.parameters()) + \
-    #              list(tf_classifier.parameters()) + list(mc_classifier.parameters()) + list(regressor.parameters())
-    #### NO GRADIENTS ####
-
     optimizer, scheduler = src.util.set_optim(opt, model, all_params)
 
     logger.info(f"TRAIN EXAMPLE {len(train_dataset)}")
@@ -930,10 +869,6 @@ if __name__ == "__main__":
         eval_dataset,
         opt,
         fid_collator,
-        forecaster_collate_fn,
         best_dev_em,
         checkpoint_path,
     )
-
-    # logger.info("Start evaluating")
-    # evaluate(forecaster, model, eval_dataset, fid_collator, forecaster_collate_fn, opt, 0)
