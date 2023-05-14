@@ -18,7 +18,6 @@ class FiDDataset(torch.utils.data.Dataset):
         title_prefix="title:",
         passage_prefix="context:",
         choices_prefix="choices:",
-        bound_prefix="bounds:",
         max_choices=12,
         cat=None,
     ):
@@ -34,11 +33,15 @@ class FiDDataset(torch.utils.data.Dataset):
             self.target = max_choices + 2
         # Format the question.
         self.question = question_prefix + " " + question["question"]
+        self.choices = question["choices"]
         if question["qtype"] == "mc":
             choices = question["choices"]
             formatted_choices = [f"{i+1}: {choice}" for i, choice in enumerate(choices)]
             choice_string = " | ".join(formatted_choices)
             self.question = f"{self.question} {choices_prefix} {choice_string}."
+        
+        self.title_prefix = title_prefix
+        self.passage_prefix = passage_prefix
 
     def __len__(self):
         return len(self.research_schedule.index.unique())
@@ -58,7 +61,7 @@ class FiDDataset(torch.utils.data.Dataset):
         return {
             "index": index,
             "question": self.question,
-            "target": self.get_target(),
+            "target": self.target,
             "choices": self.choices,
             "passages": passages,
             "scores": scores,

@@ -572,8 +572,10 @@ class ForecastingDataset:
         qtype = question_data.get("qtype")
         if qtype == "t/f":
             code = 0
+            answer = bool(answer)
         elif qtype == "mc":
             code = 1
+            answer = int(answer)
         elif qtype == "num":
             code = 2
 
