@@ -27,7 +27,7 @@ from src.options import Options
 import src.slurm
 import src.util
 import src.evaluation
-import src.forecasting_data_multihead
+from src.forecasting_data_multihead import ForecastingQuestion
 import src.model
 
 # from transformers import TransformerWrapper, Decoder
@@ -37,7 +37,7 @@ import pandas as pd
 
 def train(
     model,
-    fid_model,
+    encoder,
     optimizer,
     scheduler,
     all_params,
@@ -45,7 +45,7 @@ def train(
     train_dataset,
     eval_dataset,
     opt,
-    fid_collator,
+    day_collator,
     best_dev_em,
     checkpoint_path,
 ):
@@ -82,46 +82,51 @@ def train(
         time0 = time.time()
         for batch in train_dataloader:
             step += 1
-            examples = []
-            labels = []
-            true_labels = []
-            cats = []
-            for fid_dataset, targets, true_label, cat in batch:
-                fid_outputs = get_fid_outputs(
-                    fid_model, fid_dataset, opt, fid_collator, mode="train"
+            categories = []
+            questions = []
+            answers = []
+            crowd_forecasts = []
+            for category, question, answer, crowd_forecast in batch:
+                question_encodings = encode_question(
+                    encoder, question, opt, day_collator
                 )
-                targets = targets.to(device=fid_outputs.device)
+                crowd_forecast = crowd_forecast.to(device=question_encodings.device)
 
-                examples.append(fid_outputs)
-                labels.append(targets)
-                true_labels.append(true_label)
-                cats.append(cat)
+                questions.append(question_encodings)
+                crowd_forecasts.append(crowd_forecast)
+                answers.append(answer)
+                categories.append(category)
 
-            examples = pad_sequence(examples, batch_first=True)
-            labels = pad_sequence(labels, batch_first=True, padding_value=-1)
-            mask = (labels == -1).all(dim=2)
-            cats = torch.tensor(cats, device=mask.device)
-            true_labels = torch.tensor(true_labels, device=mask.device)
+            questions = pad_sequence(questions, batch_first=True)
+            crowd_forecasts = pad_sequence(
+                crowd_forecasts, batch_first=True, padding_value=-1
+            )
+            mask = (crowd_forecasts == -1).all(dim=2)
+            categories = torch.tensor(categories, device=mask.device)
+            answers = torch.tensor(answers, device=mask.device)
             seq_lengths = mask.sum(dim=1)
 
-            hidden_state = model(examples, mask=mask)
+            hidden_state = model(questions, mask=mask)
 
-            tf_logits = tf_classifier(hidden_state)[cats == 0]
-            mc_logits = mc_classifier(hidden_state)[cats == 1]
-            re_logits = regressor(hidden_state)[cats == 2]
+            mc_logits = mc_classifier(hidden_state)[categories == 0]
+            tf_logits = tf_classifier(hidden_state)[categories == 1]
+            re_logits = regressor(hidden_state)[categories == 2]
+            re_logits = re_logits.squeeze(-1)
 
             tf_probs = F.softmax(tf_logits, dim=-1)[..., 0]
 
-            re_results = regressor(hidden_state).squeeze(-1)[cats == 2, ...]
-            tf_labels = labels[cats == 0, ...][..., 0:1]
-            mc_labels = labels[cats == 1, ...]
-            re_labels = labels[cats == 2, ...][..., 0]
-            tf_mask = mask[cats == 0, ...]
-            mc_mask = mask[cats == 1, ...]
-            mc_mask_indi = mc_labels >= 0.0
-            re_mask = mask[cats == 2, ...]
+            re_results = regressor(hidden_state).squeeze(-1)[categories == 2, ...]
 
-            loss_tf, loss_mc, loss_re = (
+            mc_labels = crowd_forecasts[categories == 0, :, :]
+            tf_labels = crowd_forecasts[categories == 1, :, 0]
+            re_labels = crowd_forecasts[categories == 2, :, 0]
+            mc_mask = mask[categories == 0]
+            tf_mask = mask[categories == 1]
+            re_mask = mask[categories == 2]
+            mc_mask_indi = mc_labels >= 0.0
+            
+
+            batch_loss, loss_mc, loss_re = (
                 torch.tensor(0.0).cuda(),
                 torch.tensor(0.0).cuda(),
                 torch.tensor(0.0).cuda(),
@@ -131,41 +136,39 @@ def train(
                 mc_mask.sum().item(),
                 re_mask.sum().item(),
             )
-            size_tf_seq, size_mc_seq, size_re_seq = (
-                tf_mask.sum(dim=1),
-                mc_mask.sum(dim=1),
-                re_mask.sum(dim=1),
-            )
-            if len(tf_labels) > 0:
-                loss_tf_logprobs = nn.LogSoftmax(dim=2)(tf_logits)
-                answers = torch.cat(tf_labels, 1 - tf_labels, dim=2)
-                loss_tf = - loss_tf_logprobs * answers
-                loss_tf = (loss_tf.sum(dim=2) * tf_mask).sum(dim=1)
-                loss_tf = ( loss_tf / size_tf_seq ).mean()
-            if len(mc_labels) > 0:
-                loss_mc_logprobs = loss_fn_LSM(mc_logits)
-                loss_mc = -loss_mc_logprobs * mc_labels
-                loss_mc = (
-                    (loss_mc * mc_mask_indi).sum(dim=(1, 2)) / size_mc_seq
-                ).mean() / 1.74
-            if len(re_labels) > 0:
-                loss_re = loss_fn_re(re_results, re_labels)
-                loss_re = ((loss_re * re_mask).sum(dim=1) / size_re_seq).mean() / 0.18
 
-            train_loss = loss_tf + loss_mc + loss_re  # TODO: re-weigh?
+            total_loss_mc = 0
+            total_loss_tf = 0
+            total_loss_num = 0
+            if len(mc_labels) > 0:
+                mc_logprobs = -nn.LogSoftmax(dim=2)(tf_logits)
+                losses_mc = (mc_logprobs * mc_labels).sum(dim=2)
+                total_loss_mc = (losses_mc * mc_mask).sum()
+            if len(tf_labels) > 0:
+                tf_logprobs = -nn.LogSoftmax(dim=2)(tf_logits)
+                losses_true = tf_labels * tf_logprobs[:, :, 0]
+                losses_false = (1 - tf_labels) * tf_logprobs[:, :, 1]
+                losses_tf = losses_true + losses_false
+                total_loss_tf = (losses_tf * tf_mask).sum()
+            if len(re_labels) > 0:
+                losses_num = nn.MSELoss(reduction="none")(re_results, re_labels)
+                total_loss_num = (losses_num * re_mask).sum()
+
+            train_loss = (total_loss_mc + total_loss_tf + total_loss_num) / mask.sum()  # TODO: re-weigh?
 
             train_loss.backward()
 
-            seq_ends_indices_tf = seq_lengths[cats == 0].unsqueeze(-1)
-            seq_ends_indices_mc = seq_lengths[cats == 1].unsqueeze(-1)
+            seq_ends_indices_tf = seq_lengths[categories == 0].unsqueeze(-1)
+            seq_ends_indices_mc = seq_lengths[categories == 1].unsqueeze(-1)
+            seq_ends_indices_re = seq_lengths[categories == 2].unsqueeze(-1)
             seq_ends_expand = seq_ends_indices_mc.expand(
                 -1, mc_labels.size()[-1]
             ).unsqueeze(1)
-            seq_ends_indices_re = seq_lengths[cats == 2].unsqueeze(-1)
+            
 
-            true_labels_tf = true_labels[cats == 0]
-            true_labels_mc = true_labels[cats == 1]
-            true_labels_re = true_labels[cats == 2]
+            true_labels_tf = answers[categories == 0]
+            true_labels_mc = answers[categories == 1]
+            true_labels_re = answers[categories == 2]
 
             if len(true_labels_tf) > 0:
                 crowd_preds_tf = (
@@ -228,7 +231,7 @@ def train(
             curr_loss += train_loss.item()
 
             if size_tf > 0:
-                curr_loss_tf += src.util.average_main(loss_tf, opt).item()
+                curr_loss_tf += src.util.average_main(batch_loss, opt).item()
             if size_mc > 0:
                 curr_loss_mc += src.util.average_main(loss_mc, opt).item()
             if size_re > 0:
@@ -264,9 +267,9 @@ def train(
 
         dev_em, test_loss, crowd_em = evaluate(
             model,
-            fid_model,
+            encoder,
             eval_dataset,
-            fid_collator,
+            day_collator,
             forecaster_collate_fn,
             opt,
             epoch,
@@ -295,7 +298,7 @@ def train(
 
     if opt.is_main:
         src.util.save(
-            fid_model,
+            encoder,
             optimizer,
             scheduler,
             step,
@@ -349,7 +352,7 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
                 [],
             )
             for fid_dataset, targets, true_label, cat in batch:
-                fid_outputs = get_fid_outputs(
+                fid_outputs = encode_question(
                     fid_model, fid_dataset, opt, fid_collator, mode="eval"
                 )
                 fid_outputs_batch.append(fid_outputs)
@@ -534,25 +537,15 @@ class ForecastingDataset:
         crowd,
         schedule,
         corpus,
-        opt,
-        max_seq_len=128,
+        max_days=128,
         n_context=None,
-        question_prefix="question:",
-        title_prefix="title:",
-        passage_prefix="context:",
-        choices_prefix="choices:",
     ):
         self.schedule = schedule
         self.questions = questions.loc[schedule.keys(), :]
         self.crowd = crowd
         self.corpus = corpus
-        self.opt = opt
-        self.max_seq_len = max_seq_len
+        self.max_days = max_days
         self.n_context = n_context
-        self.question_prefix = question_prefix
-        self.title_prefix = title_prefix
-        self.passage_prefix = passage_prefix
-        self.choices_prefix = choices_prefix
 
     def __len__(self):
         return len(self.questions)
@@ -560,50 +553,45 @@ class ForecastingDataset:
     def __getitem__(self, index):
         question_data = self.questions.iloc[index, :]
         question_id = question_data.name
-        q_schedule = self.schedule.get(question_id)
-        q_crowd = self.crowd.get(question_id)
-        q_schedule = pd.DataFrame(q_schedule).set_index("date")
-        q_crowd = pd.DataFrame.from_dict(q_crowd, orient="index")
-        q_schedule.index = pd.to_datetime(q_schedule.index)
-        q_crowd.index = pd.to_datetime(q_crowd.index)
-        truncated_common_dates = q_crowd.index.intersection(
-            q_schedule.index
-        ).sort_values(ascending=False)[: self.max_seq_len]
-        q_schedule = q_schedule.loc[truncated_common_dates, :]
-        q_crowd = q_crowd.loc[truncated_common_dates, :]
-        research_materal = self.corpus.loc[q_schedule["doc_id"], :]
+        schedule = self.schedule.get(question_id)
+        crowd = self.crowd.get(question_id)
+        schedule = pd.DataFrame(schedule).set_index("date")
+        crowd = pd.DataFrame.from_dict(crowd, orient="index")
+        schedule.index = pd.to_datetime(schedule.index)
+        crowd.index = pd.to_datetime(crowd.index)
+        active_dates = crowd.index.intersection(schedule.index)
+        active_dates = active_dates.sort_values(ascending=False)[: self.max_days]
+        schedule = schedule.loc[active_dates, :]
+        crowd = crowd.loc[active_dates, :]
+        research_materal = self.corpus.loc[schedule["doc_id"], :]
         answer = question_data.get("answer")
         qtype = question_data.get("qtype")
-        if qtype == "t/f":
-            code = 0
+        if qtype == "mc":
+            category = 0
             answer = bool(answer)
-        elif qtype == "mc":
-            code = 1
+        elif qtype == "t/f":
+            category = 1
             answer = int(answer)
         elif qtype == "num":
-            code = 2
+            category = 2
 
-        targets = torch.tensor(q_crowd.to_numpy())
+        crowd = torch.tensor(crowd.to_numpy())
 
         # Pad targets to be n x max_choice_len
-        targets_padded = torch.full((targets.size(0), max_choices), -1.0)
-        targets_padded[: targets.size(0), : targets.size(1)] = targets
+        crowd_padded = torch.full((crowd.size(0), max_choices), -1.0)
+        crowd_padded[: crowd.size(0), : crowd.size(1)] = crowd
 
-        fid_dataset = src.forecasting_data_multihead.FiDDataset(
+        question = ForecastingQuestion(
             question_data,
-            q_schedule,
+            schedule,
             research_materal,
             self.n_context,
-            self.question_prefix,
-            self.title_prefix,
-            self.passage_prefix,
-            self.choices_prefix,
             max_choices,
         )
-        return fid_dataset, targets_padded, answer, code
+        return category, question, answer, crowd_padded
 
 
-def get_fid_outputs(model, dataset, opt, collator, mode):
+def encode_question(model, dataset, opt, collator, mode):
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(
         dataset, sampler=sampler, batch_size=16, drop_last=False, collate_fn=collator
@@ -745,8 +733,7 @@ if __name__ == "__main__":
         train_crowd,
         train_schedule,
         corpus,
-        opt,
-        max_seq_len=opt.max_seq_len,
+        max_days=opt.max_seq_len,
         n_context=opt.n_context,
     )
     test_questions_path = os.path.join(script_dir, opt.test_questions)
@@ -764,8 +751,7 @@ if __name__ == "__main__":
         test_crowd,
         test_schedule,
         corpus,
-        opt,
-        max_seq_len=opt.max_seq_len,
+        max_days=opt.max_seq_len,
         n_context=opt.n_context,
     )
 

@@ -7,19 +7,14 @@
 import torch
 
 
-class FiDDataset(torch.utils.data.Dataset):
+class ForecastingQuestion(torch.utils.data.Dataset):
     def __init__(
         self,
         question,
         research_schedule,
         research_material,
-        n_context=None,
-        question_prefix="question:",
-        title_prefix="title:",
-        passage_prefix="context:",
-        choices_prefix="choices:",
+        n_context=2,
         max_choices=12,
-        cat=None,
     ):
         self.research_schedule = research_schedule.sort_index(ascending=False)
         self.research_material = research_material
@@ -32,16 +27,13 @@ class FiDDataset(torch.utils.data.Dataset):
         elif question["qtype"] == "num":
             self.target = max_choices + 2
         # Format the question.
-        self.question = question_prefix + " " + question["question"]
+        self.question = "question: " + question["question"]
         self.choices = question["choices"]
         if question["qtype"] == "mc":
             choices = question["choices"]
             formatted_choices = [f"{i+1}: {choice}" for i, choice in enumerate(choices)]
             choice_string = " | ".join(formatted_choices)
-            self.question = f"{self.question} {choices_prefix} {choice_string}."
-
-        self.title_prefix = title_prefix
-        self.passage_prefix = passage_prefix
+            self.question = f"{self.question} choices: {choice_string}."
 
     def __len__(self):
         return len(self.research_schedule.index.unique())
