@@ -49,14 +49,6 @@ def train(
     best_dev_em,
     checkpoint_path,
 ):
-    if opt.is_main:
-        try:
-            tb_logger = torch.utils.tensorboard.SummaryWriter(
-                Path(opt.checkpoint_dir) / opt.name
-            )
-        except:
-            tb_logger = None
-            logger.warning("Tensorboard is not available.")
 
     torch.manual_seed(opt.global_rank + opt.seed)
     train_dataloader = DataLoader(
@@ -70,14 +62,6 @@ def train(
 
     model.train()
     for epoch in range(1, opt.epochs, 2):
-        curr_loss, curr_loss_tf, curr_loss_mc, curr_loss_re = 0.0, 0.0, 0.0, 0.0
-        em_tf, em_mc, em_re = [], [], []
-        exactmatch = []
-        crowd_em_tf, crowd_em_mc, crowd_em_re = [], [], []
-        crowd_exactmatch = []
-        my_preds_tf, my_preds_mc, my_preds_re = [], [], []
-        time0 = time.time()
-
         for batch in train_dataloader:
             step += 1
             categories = []
@@ -102,7 +86,6 @@ def train(
             mask = (crowd_forecasts == -1).all(dim=2)
             categories = torch.tensor(categories, device=mask.device)
             answers = torch.tensor(answers, device=mask.device)
-            seq_lengths = mask.sum(dim=1)
 
             hidden_state = model(questions, mask=mask)
 
@@ -111,35 +94,18 @@ def train(
             re_logits = regressor(hidden_state)[categories == 2]
             re_logits = re_logits.squeeze(-1)
 
-            tf_probs = F.softmax(tf_logits, dim=-1)[..., 0]
-
-            re_results = regressor(hidden_state).squeeze(-1)[categories == 2, ...]
-
             mc_labels = crowd_forecasts[categories == 0, :, :]
             tf_labels = crowd_forecasts[categories == 1, :, 0]
             re_labels = crowd_forecasts[categories == 2, :, 0]
             mc_mask = mask[categories == 0]
             tf_mask = mask[categories == 1]
             re_mask = mask[categories == 2]
-            mc_mask_indi = mc_labels >= 0.0
-            
-
-            batch_loss, loss_mc, loss_re = (
-                torch.tensor(0.0).cuda(),
-                torch.tensor(0.0).cuda(),
-                torch.tensor(0.0).cuda(),
-            )
-            size_tf, size_mc, size_re = (
-                tf_mask.sum().item(),
-                mc_mask.sum().item(),
-                re_mask.sum().item(),
-            )
 
             total_loss_mc = 0
             total_loss_tf = 0
             total_loss_num = 0
             if len(mc_labels) > 0:
-                mc_logprobs = -nn.LogSoftmax(dim=2)(tf_logits)
+                mc_logprobs = -nn.LogSoftmax(dim=2)(mc_logits)
                 losses_mc = (mc_logprobs * mc_labels).sum(dim=2)
                 total_loss_mc = (losses_mc * mc_mask).sum()
             if len(tf_labels) > 0:
@@ -149,119 +115,14 @@ def train(
                 losses_tf = losses_true + losses_false
                 total_loss_tf = (losses_tf * tf_mask).sum()
             if len(re_labels) > 0:
-                losses_num = nn.MSELoss(reduction="none")(re_results, re_labels)
+                losses_num = nn.MSELoss(reduction="none")(re_logits, re_labels)
                 total_loss_num = (losses_num * re_mask).sum()
 
             train_loss = (total_loss_mc + total_loss_tf + total_loss_num) / mask.sum()  # TODO: re-weigh?
 
             train_loss.backward()
 
-            seq_ends_indices_tf = seq_lengths[categories == 0].unsqueeze(-1)
-            seq_ends_indices_mc = seq_lengths[categories == 1].unsqueeze(-1)
-            seq_ends_indices_re = seq_lengths[categories == 2].unsqueeze(-1)
-            seq_ends_expand = seq_ends_indices_mc.expand(
-                -1, mc_labels.size()[-1]
-            ).unsqueeze(1)
-            
-
-            true_labels_tf = answers[categories == 0]
-            true_labels_mc = answers[categories == 1]
-            true_labels_re = answers[categories == 2]
-
-            if len(true_labels_tf) > 0:
-                crowd_preds_tf = (
-                    torch.gather(tf_labels.squeeze(-1), -1, seq_ends_indices_tf).view(
-                        -1
-                    )
-                    > 0.5
-                )
-                preds_tf = (
-                    torch.gather(tf_probs, -1, seq_ends_indices_tf).view(-1) > 0.5
-                )
-            else:
-                crowd_preds_tf = torch.tensor([], device=true_labels_tf.device)
-                preds_tf = torch.tensor([], device=true_labels_tf.device)
-
-            if len(true_labels_mc) > 0:
-                crowd_preds_mc = torch.argmax(
-                    torch.gather(mc_labels, 1, seq_ends_expand).squeeze(1), dim=-1
-                )
-                preds_mc = torch.argmax(
-                    torch.gather(mc_logits, 1, seq_ends_expand).squeeze(1), dim=-1
-                )
-            else:
-                crowd_preds_mc = torch.tensor([], device=true_labels_mc.device)
-                preds_mc = torch.tensor([], device=true_labels_mc.device)
-
-            if len(true_labels_re) > 0:
-                crowd_preds_re = torch.gather(re_labels, -1, seq_ends_indices_re).view(
-                    -1
-                )
-                preds_re = torch.gather(re_results, -1, seq_ends_indices_re).view(-1)
-            else:
-                crowd_preds_re = torch.tensor([], device=true_labels_re.device)
-                preds_re = torch.tensor([], device=true_labels_re.device)
-
-            crowd_em_tf.extend(
-                (true_labels_tf == crowd_preds_tf).detach().cpu().numpy()
-            )
-            em_tf.extend((true_labels_tf == preds_tf).detach().cpu().numpy())
-            crowd_em_mc.extend(
-                (true_labels_mc == crowd_preds_mc).detach().cpu().numpy()
-            )
-            em_mc.extend((true_labels_mc == preds_mc).detach().cpu().numpy())
-            crowd_em_re.extend(
-                -torch.abs(true_labels_re - crowd_preds_re).detach().cpu().numpy()
-            )
-            em_re.extend(-torch.abs(true_labels_re - preds_re).detach().cpu().numpy())
-
-            my_preds_tf.extend(preds_tf.detach().cpu().numpy())
-            my_preds_mc.extend(preds_mc.detach().cpu().numpy())
-            my_preds_re.extend(preds_re.detach().cpu().numpy())
-
-            if step % opt.accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(all_params, opt.clip)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-            train_loss = src.util.average_main(train_loss, opt)
-            curr_loss += train_loss.item()
-
-            if size_tf > 0:
-                curr_loss_tf += src.util.average_main(batch_loss, opt).item()
-            if size_mc > 0:
-                curr_loss_mc += src.util.average_main(loss_mc, opt).item()
-            if size_re > 0:
-                curr_loss_re += src.util.average_main(loss_re, opt).item()
-
-
-        dev_em, test_loss, crowd_em = evaluate(
-            model,
-            encoder,
-            eval_dataset,
-            day_collator,
-            opt,
-            epoch,
-        )
         model.train()
-        if opt.is_main:
-            if dev_em > best_dev_em:
-                best_dev_em = dev_em
-            log = f"{step} / {opt.total_steps} | "
-            log += f"train: {curr_loss / len(train_dataloader):.3f}; {curr_loss_tf / len(train_dataloader):.3f} / \
-            {curr_loss_mc / len(train_dataloader):.3f} / {curr_loss_re / len(train_dataloader):.3f} | "
-            log += f"test: {test_loss:.3f} | "
-            log += f"evaluation: {100*dev_em:.2f} EM (crowd: {100*crowd_em:.2f} EM) | "
-            log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
-            logger.info(log)
-            curr_loss = 0.0
-            curr_loss_tf = 0.0
-            curr_loss_mc = 0.0
-            curr_loss_re = 0.0
-            if tb_logger is not None:
-                tb_logger.add_scalar("Evaluation", dev_em, step)
-                tb_logger.add_scalar("Training", curr_loss, step)
 
         if not opt.epochs and step > opt.total_steps:
             return
@@ -300,9 +161,6 @@ def evaluate(model, encoder, dataset, day_collator, opt, epoch):
         collate_fn=lambda data: data,
     )
     model.eval()
-
-    loss_fn_LSM = nn.LogSoftmax(dim=-1)
-    loss_fn_re = nn.MSELoss(reduction="none")
 
     total_loss = 0.0
     em_tf, em_mc, em_re = [], [], []
