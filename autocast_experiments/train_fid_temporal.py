@@ -68,9 +68,6 @@ def train(
         collate_fn=lambda data: data,
     )
 
-    loss_fn_LSM = nn.LogSoftmax(dim=-1)
-    loss_fn_re = nn.MSELoss(reduction="none")
-
     model.train()
     for epoch in range(1, opt.epochs, 2):
         curr_loss, curr_loss_tf, curr_loss_mc, curr_loss_re = 0.0, 0.0, 0.0, 0.0
@@ -80,6 +77,7 @@ def train(
         crowd_exactmatch = []
         my_preds_tf, my_preds_mc, my_preds_re = [], [], []
         time0 = time.time()
+
         for batch in train_dataloader:
             step += 1
             categories = []
@@ -237,40 +235,12 @@ def train(
             if size_re > 0:
                 curr_loss_re += src.util.average_main(loss_re, opt).item()
 
-        # out-of-order overall stats
-        crowd_exactmatch = crowd_em_tf + crowd_em_mc + crowd_em_re
-        exactmatch = em_tf + em_mc + em_re
-        # my_predictions = my_preds_tf + my_preds_mc + my_preds_re
-
-        logger.info(
-            f"Epoch {epoch} finished | {50*np.mean(exactmatch):.2f} EM | {50*np.mean(crowd_exactmatch):.2f} crowd EM"
-        )
-        if len(em_tf) == 0:
-            logger.info(f"TRAIN: For T/F: Predicted N/A")
-        else:
-            logger.info(
-                f"TRAIN: For T/F: Predicted {em_tf.count(1)} Match {em_tf.count(0)} Wrong \
-            ({my_preds_tf.count(1)} YES {my_preds_tf.count(0)} NO) | EM: {round(em_tf.count(1) / len(em_tf) * 100, 2)}"
-            )
-        if len(em_mc) == 0:
-            logger.info(f"       For MC:  Predicted N/A")
-        else:
-            logger.info(
-                f"       For MC:  Predicted {em_mc.count(1)} Match {em_mc.count(0)} Wrong | \
-            EM: {round(em_mc.count(1) / len(em_mc) * 100, 2)}"
-            )
-        if len(em_re) == 0:
-            logger.info(f"       For Reg: Predicted N/A")
-        else:
-            logger.info(f"       For Reg: Predicted Dist {-np.mean(em_re)}")
-        logger.info(f"{int(time.time() - time0)} sec")
 
         dev_em, test_loss, crowd_em = evaluate(
             model,
             encoder,
             eval_dataset,
             day_collator,
-            forecaster_collate_fn,
             opt,
             epoch,
         )
@@ -319,7 +289,7 @@ def train(
         )
 
 
-def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, epoch):
+def evaluate(model, encoder, dataset, day_collator, opt, epoch):
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(
         dataset,
@@ -345,69 +315,80 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     raw_logits = []
     with torch.no_grad():
         for batch in dataloader:
-            fid_outputs_batch, targets_batch, true_labels_batch, cats_batch = (
-                [],
-                [],
-                [],
-                [],
-            )
-            for fid_dataset, targets, true_label, cat in batch:
-                fid_outputs = encode_question(
-                    fid_model, fid_dataset, opt, fid_collator, mode="eval"
+            step += 1
+            categories = []
+            questions = []
+            answers = []
+            crowd_forecasts = []
+            for category, question, answer, crowd_forecast in batch:
+                question_encodings = encode_question(
+                    encoder, question, opt, day_collator
                 )
-                fid_outputs_batch.append(fid_outputs)
-                targets = targets.to(device=fid_outputs.device)
-                targets_batch.append(targets)
-                true_labels_batch.append(true_label)
-                cats_batch.append(cat)
+                crowd_forecast = crowd_forecast.to(device=question_encodings.device)
 
-            forecaster_outputs = forecaster_collator(
-                fid_outputs_batch, targets_batch, true_labels_batch, cats_batch
+                questions.append(question_encodings)
+                crowd_forecasts.append(crowd_forecast)
+                answers.append(answer)
+                categories.append(category)
+
+            questions = pad_sequence(questions, batch_first=True)
+            crowd_forecasts = pad_sequence(
+                crowd_forecasts, batch_first=True, padding_value=-1
             )
-            X, mask, labels, true_labels, categories, seq_ends = forecaster_outputs
+            mask = (crowd_forecasts == -1).all(dim=2)
+            categories = torch.tensor(categories, device=mask.device)
+            answers = torch.tensor(answers, device=mask.device)
+            seq_lengths = mask.sum(dim=1)
 
-            hidden_state = model(X, mask=mask)  # (B, SEQ, FiD_H)
-            tf_logits = tf_classifier(hidden_state)[categories == 0, ...]
+            hidden_state = model(questions, mask=mask)
+
+            mc_logits = mc_classifier(hidden_state)[categories == 0]
+            tf_logits = tf_classifier(hidden_state)[categories == 1]
+            re_logits = regressor(hidden_state)[categories == 2]
+            re_logits = re_logits.squeeze(-1)
+
             tf_probs = F.softmax(tf_logits, dim=-1)[..., 0]
-            mc_logits = mc_classifier(hidden_state)[categories == 1, ...]
+
             re_results = regressor(hidden_state).squeeze(-1)[categories == 2, ...]
-            tf_labels = labels[categories == 0, ...][..., 0:1]
-            mc_labels = labels[categories == 1, ...]
-            re_labels = labels[categories == 2, ...][..., 0]
-            tf_mask = mask[categories == 0, ...]
-            mc_mask = mask[categories == 1, ...]
+
+            mc_labels = crowd_forecasts[categories == 0, :, :]
+            tf_labels = crowd_forecasts[categories == 1, :, 0]
+            re_labels = crowd_forecasts[categories == 2, :, 0]
+            mc_mask = mask[categories == 0]
+            tf_mask = mask[categories == 1]
+            re_mask = mask[categories == 2]
             mc_mask_indi = mc_labels >= 0.0
-            re_mask = mask[categories == 2, ...]
+            
 
-            loss_tf, loss_mc, loss_re = (
+            batch_loss, loss_mc, loss_re = (
                 torch.tensor(0.0).cuda(),
                 torch.tensor(0.0).cuda(),
                 torch.tensor(0.0).cuda(),
             )
-            size_tf_seq, size_mc_seq, size_re_seq = (
-                tf_mask.sum(dim=1),
-                mc_mask.sum(dim=1),
-                re_mask.sum(dim=1),
+            size_tf, size_mc, size_re = (
+                tf_mask.sum().item(),
+                mc_mask.sum().item(),
+                re_mask.sum().item(),
             )
-            if len(tf_labels) > 0:
-                loss_tf_logprobs = loss_fn_LSM(tf_logits)
-                loss_tf = -loss_tf_logprobs * torch.cat(
-                    (tf_labels, 1 - tf_labels), dim=-1
-                )
-                loss_tf = (
-                    (loss_tf.sum(dim=2) * tf_mask).sum(dim=1) / size_tf_seq
-                ).mean()
+
+            total_loss_mc = 0
+            total_loss_tf = 0
+            total_loss_num = 0
             if len(mc_labels) > 0:
-                loss_mc_logprobs = loss_fn_LSM(mc_logits)
-                loss_mc = -loss_mc_logprobs * mc_labels
-                loss_mc = (
-                    (loss_mc * mc_mask_indi).sum(dim=(1, 2)) / size_mc_seq
-                ).mean() / 1.74
+                mc_logprobs = -nn.LogSoftmax(dim=2)(tf_logits)
+                losses_mc = (mc_logprobs * mc_labels).sum(dim=2)
+                total_loss_mc = (losses_mc * mc_mask).sum()
+            if len(tf_labels) > 0:
+                tf_logprobs = -nn.LogSoftmax(dim=2)(tf_logits)
+                losses_true = tf_labels * tf_logprobs[:, :, 0]
+                losses_false = (1 - tf_labels) * tf_logprobs[:, :, 1]
+                losses_tf = losses_true + losses_false
+                total_loss_tf = (losses_tf * tf_mask).sum()
             if len(re_labels) > 0:
-                loss_re = loss_fn_re(re_results, re_labels)
-                loss_re = ((loss_re * re_mask).sum(dim=1) / size_re_seq).mean() / 0.18
+                losses_num = nn.MSELoss(reduction="none")(re_results, re_labels)
+                total_loss_num = (losses_num * re_mask).sum()
 
-            train_loss = loss_tf + loss_mc + loss_re  # TODO: re-weigh?
+            train_loss = (total_loss_mc + total_loss_tf + total_loss_num) / mask.sum()  # TODO: re-weigh?
             total_loss += train_loss.item()
 
             seq_ends_indices_tf = seq_ends[categories == 0].unsqueeze(-1)
@@ -417,9 +398,9 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
             ).unsqueeze(1)
             seq_ends_indices_re = seq_ends[categories == 2].unsqueeze(-1)
 
-            true_labels_tf = true_labels[categories == 0]
-            true_labels_mc = true_labels[categories == 1]
-            true_labels_re = true_labels[categories == 2]
+            true_labels_tf = answers[categories == 0]
+            true_labels_mc = answers[categories == 1]
+            true_labels_re = answers[categories == 2]
 
             if len(true_labels_tf) > 0:
                 crowd_preds_tf = (
