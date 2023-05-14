@@ -64,6 +64,7 @@ class FiDDataset(torch.utils.data.Dataset):
             "scores": scores,
         }
 
+
 def encode_passages(batch_text_passages, tokenizer, max_length):
     passage_ids, passage_masks = [], []
     for text_passages in batch_text_passages:

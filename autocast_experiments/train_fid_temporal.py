@@ -336,7 +336,6 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     time0 = time.time()
     device = torch.device("cpu")
     raw_logits = []
-    # model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
         for _, batch in enumerate(dataloader):
             fid_outputs_batch, targets_batch, true_labels_batch, cats_batch = (
