@@ -26,9 +26,9 @@ class FiDDataset(torch.utils.data.Dataset):
         self.n_context = n_context
 
         if question["qtype"] == "mc":
-            self.target = question["answer"]
+            self.target = int(question["answer"])
         elif question["qtype"] == "t/f":
-            self.target = max_choices + question["answer"]
+            self.target = max_choices + bool(question["answer"])
         elif question["qtype"] == "num":
             self.target = max_choices + 2
         # Format the question.
@@ -39,7 +39,7 @@ class FiDDataset(torch.utils.data.Dataset):
             formatted_choices = [f"{i+1}: {choice}" for i, choice in enumerate(choices)]
             choice_string = " | ".join(formatted_choices)
             self.question = f"{self.question} {choices_prefix} {choice_string}."
-        
+
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
 
@@ -51,39 +51,12 @@ class FiDDataset(torch.utils.data.Dataset):
         scores = self.research_schedule.loc[[date], :].set_index("doc_id")
         docs = scores.join(self.research_material)
         docs = docs.sample(n=self.n_context, replace=True)
-        scores = torch.tensor(docs["score"].to_numpy())
-        passages = (
-            f"{self.title_prefix} "
-            + docs["title"]
-            + f" {self.passage_prefix} "
-            + docs["text"]
-        )
+        passages = "title: " + docs["title"] + " context: " + docs["text"]
         return {
-            "index": index,
             "question": self.question,
-            "target": self.target,
-            "choices": self.choices,
             "passages": passages,
-            "scores": scores,
+            "target": self.target,
         }
-
-
-def encode_passages(batch_text_passages, tokenizer, max_length):
-    passage_ids, passage_masks = [], []
-    for text_passages in batch_text_passages:
-        p = tokenizer.batch_encode_plus(
-            text_passages,
-            max_length=max_length,
-            padding="max_length",
-            return_tensors="pt",
-            truncation=True,
-        )
-        passage_ids.append(p["input_ids"][None])
-        passage_masks.append(p["attention_mask"][None])
-
-    passage_ids = torch.cat(passage_ids, dim=0)
-    passage_masks = torch.cat(passage_masks, dim=0)
-    return passage_ids.int(), passage_masks.bool()
 
 
 class Collator(object):
@@ -97,10 +70,25 @@ class Collator(object):
         text_passages = []
         for example in batch:
             labels.append(example["target"])
-            passages = example["question"] + " " + example["passage"]
+            passages = example["question"] + " " + example["passages"]
             text_passages.append(passages.to_list())
         labels = torch.tensor(labels).view(-1, 1)
-        passage_ids, passage_masks = encode_passages(
-            text_passages, self.tokenizer, self.text_maxlength
-        )
+        passage_ids, passage_masks = self.encode_passages(text_passages)
         return (labels, passage_ids, passage_masks)
+
+    def encode_passages(self, batch_text_passages):
+        passage_ids, passage_masks = [], []
+        for text_passages in batch_text_passages:
+            p = self.tokenizer.batch_encode_plus(
+                text_passages,
+                max_length=self.text_maxlength,
+                padding="max_length",
+                return_tensors="pt",
+                truncation=True,
+            )
+            passage_ids.append(p["input_ids"][None])
+            passage_masks.append(p["attention_mask"][None])
+
+        passage_ids = torch.cat(passage_ids, dim=0)
+        passage_masks = torch.cat(passage_masks, dim=0)
+        return passage_ids.int(), passage_masks

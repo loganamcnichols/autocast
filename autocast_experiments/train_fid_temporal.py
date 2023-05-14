@@ -82,38 +82,44 @@ def train(
         time0 = time.time()
         for batch in train_dataloader:
             step += 1
-            fid_outputs_batch = []
-            targets_batch = []
-            true_labels_batch = []
-            cats_batch = []
+            examples = []
+            labels = []
+            true_labels = []
+            cats = []
             for fid_dataset, targets, true_label, cat in batch:
                 fid_outputs = get_fid_outputs(
                     fid_model, fid_dataset, opt, fid_collator, mode="train"
                 )
-                fid_outputs_batch.append(fid_outputs)
                 targets = targets.to(device=fid_outputs.device)
-                targets_batch.append(targets)
-                true_labels_batch.append(true_label)
-                cats_batch.append(cat)
 
-            forecaster_outputs = forecaster_collate_fn(
-                fid_outputs_batch, targets_batch, true_labels_batch, cats_batch
-            )
-            X, mask, labels, true_labels, categories, seq_ends = forecaster_outputs
+                examples.append(fid_outputs)
+                labels.append(targets)
+                true_labels.append(true_label)
+                cats.append(cat)
 
-            hidden_state = model(X, mask=mask)  # (B, SEQ, FiD_H)
+            examples = pad_sequence(examples, batch_first=True)
+            labels = pad_sequence(labels, batch_first=True, padding_value=-1)
+            mask = (labels == -1).all(dim=2)
+            cats = torch.tensor(cats, device=mask.device)
+            true_labels = torch.tensor(true_labels, device=mask.device)
+            seq_lengths = mask.sum(dim=1)
 
-            tf_logits = tf_classifier(hidden_state)[categories == 0, ...]
+            hidden_state = model(examples, mask=mask)
+
+            tf_logits = tf_classifier(hidden_state)[cats == 0]
+            mc_logits = mc_classifier(hidden_state)[cats == 1]
+            re_logits = regressor(hidden_state)[cats == 2]
+
             tf_probs = F.softmax(tf_logits, dim=-1)[..., 0]
-            mc_logits = mc_classifier(hidden_state)[categories == 1, ...]
-            re_results = regressor(hidden_state).squeeze(-1)[categories == 2, ...]
-            tf_labels = labels[categories == 0, ...][..., 0:1]
-            mc_labels = labels[categories == 1, ...]
-            re_labels = labels[categories == 2, ...][..., 0]
-            tf_mask = mask[categories == 0, ...]
-            mc_mask = mask[categories == 1, ...]
+
+            re_results = regressor(hidden_state).squeeze(-1)[cats == 2, ...]
+            tf_labels = labels[cats == 0, ...][..., 0:1]
+            mc_labels = labels[cats == 1, ...]
+            re_labels = labels[cats == 2, ...][..., 0]
+            tf_mask = mask[cats == 0, ...]
+            mc_mask = mask[cats == 1, ...]
             mc_mask_indi = mc_labels >= 0.0
-            re_mask = mask[categories == 2, ...]
+            re_mask = mask[cats == 2, ...]
 
             loss_tf, loss_mc, loss_re = (
                 torch.tensor(0.0).cuda(),
@@ -131,13 +137,11 @@ def train(
                 re_mask.sum(dim=1),
             )
             if len(tf_labels) > 0:
-                loss_tf_logprobs = loss_fn_LSM(tf_logits)
-                loss_tf = -loss_tf_logprobs * torch.cat(
-                    (tf_labels, 1 - tf_labels), dim=-1
-                )
-                loss_tf = (
-                    (loss_tf.sum(dim=2) * tf_mask).sum(dim=1) / size_tf_seq
-                ).mean()
+                loss_tf_logprobs = nn.LogSoftmax(dim=2)(tf_logits)
+                answers = torch.cat(tf_labels, 1 - tf_labels, dim=2)
+                loss_tf = - loss_tf_logprobs * answers
+                loss_tf = (loss_tf.sum(dim=2) * tf_mask).sum(dim=1)
+                loss_tf = ( loss_tf / size_tf_seq ).mean()
             if len(mc_labels) > 0:
                 loss_mc_logprobs = loss_fn_LSM(mc_logits)
                 loss_mc = -loss_mc_logprobs * mc_labels
@@ -152,16 +156,16 @@ def train(
 
             train_loss.backward()
 
-            seq_ends_indices_tf = seq_ends[categories == 0].unsqueeze(-1)
-            seq_ends_indices_mc = seq_ends[categories == 1].unsqueeze(-1)
+            seq_ends_indices_tf = seq_lengths[cats == 0].unsqueeze(-1)
+            seq_ends_indices_mc = seq_lengths[cats == 1].unsqueeze(-1)
             seq_ends_expand = seq_ends_indices_mc.expand(
                 -1, mc_labels.size()[-1]
             ).unsqueeze(1)
-            seq_ends_indices_re = seq_ends[categories == 2].unsqueeze(-1)
+            seq_ends_indices_re = seq_lengths[cats == 2].unsqueeze(-1)
 
-            true_labels_tf = true_labels[categories == 0]
-            true_labels_mc = true_labels[categories == 1]
-            true_labels_re = true_labels[categories == 2]
+            true_labels_tf = true_labels[cats == 0]
+            true_labels_mc = true_labels[cats == 1]
+            true_labels_re = true_labels[cats == 2]
 
             if len(true_labels_tf) > 0:
                 crowd_preds_tf = (
@@ -337,7 +341,7 @@ def evaluate(model, fid_model, dataset, fid_collator, forecaster_collator, opt, 
     device = torch.device("cpu")
     raw_logits = []
     with torch.no_grad():
-        for _, batch in enumerate(dataloader):
+        for batch in dataloader:
             fid_outputs_batch, targets_batch, true_labels_batch, cats_batch = (
                 [],
                 [],
@@ -613,7 +617,7 @@ def get_fid_outputs(model, dataset, opt, collator, mode):
     ### NO GRADIENTS ####
 
     model.train(mode == "train")
-    for i, batch in enumerate(dataloader):
+    for batch in dataloader:
         (labels, context_ids, context_mask) = batch
 
         # TODO: we could pass in labels here too for additional training signal
@@ -624,8 +628,7 @@ def get_fid_outputs(model, dataset, opt, collator, mode):
                 labels=labels.cuda(),  # we use true labels for FiD hidden states
                 output_hidden_states=True,
             )
-        hidden_state = model_output[3][-1]
-        outputs.append(hidden_state)
+        outputs.append(model_output.decoder_hidden_states[-1])
 
     outputs = torch.cat(outputs, dim=0)  # (n_examples, 1, hidden_size)
     outputs = outputs.view(outputs.shape[0], -1)  # (n_examples, hidden_size)
@@ -634,20 +637,6 @@ def get_fid_outputs(model, dataset, opt, collator, mode):
         outputs = outputs.detach()
 
     return outputs
-
-
-def forecaster_collate_fn(examples, labels, true_labels, cats):
-    seq_lengths = [len(label) for label in labels]
-    examples = pad_sequence(examples, batch_first=True, padding_value=0.0)
-    labels = pad_sequence(labels, batch_first=True, padding_value=-2.0)
-    mask = torch.ones_like(labels[:, :, 0]).bool()
-    for i, seq_len in enumerate(seq_lengths):
-        mask[i][seq_len:] = 0
-    seq_ends = torch.tensor(seq_lengths, device=mask.device) - 1  # last day to predict
-    true_labels = torch.tensor(true_labels, device=mask.device)
-    cats = torch.tensor(cats, device=mask.device)
-    assert examples.shape[:2] == mask.shape, (examples.shape[:2], mask.shape)
-    return examples, mask, labels, true_labels, cats, seq_ends
 
 
 def get_gpt(fid_hidden_size, gpt_hidden_size, opt, model_name="gpt2"):
