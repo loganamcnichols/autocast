@@ -2,6 +2,7 @@ autocast_experiments/data/cc_news/*
 __pycache__/
 *.json
 *.log
-checkpoint/*
+*/checkpoint/*
 test.py
 *.obj
+runs/*

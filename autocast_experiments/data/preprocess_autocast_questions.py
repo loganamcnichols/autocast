@@ -26,6 +26,9 @@ for question in questions:
     # Filter for resolved questions.
     if question.get("status") != "Resolved":
         continue
+    # Filter out numeric questions.
+    if question.get("qtype") == "num":
+        continue
 
     publish_time = parser.parse(question.get("publish_time"))
     close_time = parser.parse(question.get("close_time"))
@@ -56,27 +59,33 @@ for question in questions:
     publish_time_str = publish_time_utc.strftime("%Y-%m-%d")
     close_time_str = close_time_utc.strftime("%Y-%m-%d")
 
+    date_range = pd.date_range(publish_time_str, close_time_str, tz="UTC")
+
     # Update the question with the new datetime strings
     question["publish_time"] = publish_time_str
     question["close_time"] = close_time_str
 
     # Calculate the crowd forecasts.
     forecasts = question.pop("crowd")
+    dates = pd.to_datetime(
+        [forecast["timestamp"] for forecast in forecasts],
+        format="ISO8601",
+    )
+    data = [forecast["forecast"] for forecast in forecasts]
     crowd_forecast = (
         pd.DataFrame(
-            data=[forecast["forecast"] for forecast in forecasts],
-            index=pd.to_datetime(
-                [forecast["timestamp"] for forecast in forecasts],
-                format="ISO8601",
-            ),
+            data=data,
+            index=dates,
             columns=question["choices"],
         )
-        .groupby(pd.Grouper(freq="D"))
+        .resample("D")
         .mean()
+        .reindex(date_range)
         .fillna(method="ffill")
+        .fillna(method="bfill")
     )
-    crowd_forecast.index = crowd_forecast.index.strftime("%Y-%m-%d")
-    crowd_forecast = crowd_forecast.to_dict(orient="index")
+
+    crowd_forecast = crowd_forecast.to_numpy().tolist()
 
     # Add question and crowd forecast to correct dataset.
     qid = question.pop("id")

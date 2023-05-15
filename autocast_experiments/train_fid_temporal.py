@@ -8,14 +8,13 @@ import json
 import os
 import time
 from datasets import Dataset
-import pickle
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 import transformers
-import numpy as np
+from transformers import T5ForConditionalGeneration
 from pathlib import Path
 from torch.utils.data import (
     DataLoader,
@@ -23,6 +22,7 @@ from torch.utils.data import (
     SequentialSampler,
 )
 from src.options import Options
+from src.forecasting_data_multihead import Collator
 
 import src.slurm
 import src.util
@@ -33,6 +33,12 @@ import src.model
 # from transformers import TransformerWrapper, Decoder
 from transformers import GPT2Model
 import pandas as pd
+from typing import Dict, Iterable, List, NewType, Sized
+
+DocID = NewType("DocID", int)
+QuestionID = NewType("QuestionID", str)
+
+from torch.utils.tensorboard import SummaryWriter
 
 
 def train(
@@ -40,16 +46,15 @@ def train(
     encoder,
     optimizer,
     scheduler,
-    all_params,
-    step,
     train_dataset,
-    eval_dataset,
     opt,
     day_collator,
     best_dev_em,
     checkpoint_path,
+    mc_classifier,
+    tf_classifier,
+    all_params,
 ):
-
     torch.manual_seed(opt.global_rank + opt.seed)
     train_dataloader = DataLoader(
         train_dataset,
@@ -59,11 +64,13 @@ def train(
         num_workers=2,
         collate_fn=lambda data: data,
     )
-
+    # Initialize the SummaryWriter
+    writer = SummaryWriter()
     model.train()
-    for epoch in range(1, opt.epochs, 2):
-        for batch in train_dataloader:
-            step += 1
+    for epoch in range(opt.epochs):
+        running_loss = 0
+        for i, batch in enumerate(train_dataloader):
+            time0 = time.time()
             categories = []
             questions = []
             answers = []
@@ -80,10 +87,8 @@ def train(
                 categories.append(category)
 
             questions = pad_sequence(questions, batch_first=True)
-            crowd_forecasts = pad_sequence(
-                crowd_forecasts, batch_first=True, padding_value=-1
-            )
-            mask = (crowd_forecasts == -1).all(dim=2)
+            crowd_forecasts = pad_sequence(crowd_forecasts, batch_first=True)
+            mask = (crowd_forecasts != 0).any(dim=2)
             categories = torch.tensor(categories, device=mask.device)
             answers = torch.tensor(answers, device=mask.device)
 
@@ -91,19 +96,14 @@ def train(
 
             mc_logits = mc_classifier(hidden_state)[categories == 0]
             tf_logits = tf_classifier(hidden_state)[categories == 1]
-            # re_logits = regressor(hidden_state)[categories == 2]
-            # re_logits = re_logits.squeeze(-1)
 
             mc_labels = crowd_forecasts[categories == 0, :, :]
             tf_labels = crowd_forecasts[categories == 1, :, 0]
-            re_labels = crowd_forecasts[categories == 2, :, 0]
             mc_mask = mask[categories == 0]
             tf_mask = mask[categories == 1]
-            # re_mask = mask[categories == 2]
 
             total_loss_mc = 0
             total_loss_tf = 0
-            total_loss_num = 0
             if len(mc_labels) > 0:
                 mc_logprobs = -nn.LogSoftmax(dim=2)(mc_logits)
                 losses_mc = (mc_logprobs * mc_labels).sum(dim=2)
@@ -114,43 +114,54 @@ def train(
                 losses_false = (1 - tf_labels) * tf_logprobs[:, :, 1]
                 losses_tf = losses_true + losses_false
                 total_loss_tf = (losses_tf * tf_mask).sum()
-            # if len(re_labels) > 0:
-            #     losses_num = nn.MSELoss(reduction="none")(re_logits, re_labels)
-            #     total_loss_num = (losses_num * re_mask).sum()
 
-            train_loss = (total_loss_mc + total_loss_tf + total_loss_num) / mask.sum()  # TODO: re-weigh?
-
+            train_loss = (total_loss_mc + total_loss_tf) / mask.sum()
             train_loss.backward()
+            torch.nn.utils.clip_grad_norm_(all_params, opt.clip)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            running_loss += train_loss.item()
+            if i % 10 == 9:
+                print("epoch:", epoch + 1, "batch:", i + 1)
+                print("running loss:", running_loss / 10)
+                print("time for batch", time.time() - time0)
+                writer.add_scalar(
+                    "training loss",
+                    running_loss / 10,
+                    epoch * len(train_dataloader) + i,
+                )
+                running_loss = 0.0
 
         model.train()
 
-        if not opt.epochs and step > opt.total_steps:
-            return
-
-    if opt.is_main:
-        src.util.save(
-            encoder,
-            optimizer,
-            scheduler,
-            step,
-            best_dev_em,
-            opt,
-            checkpoint_path,
-            f"epoch-{epoch}-fidmodel",
-        )
-        src.util.save(
-            model,
-            optimizer,
-            scheduler,
-            step,
-            best_dev_em,
-            opt,
-            checkpoint_path,
-            f"epoch-{epoch}-gptmodel",
-        )
+        if opt.is_main:
+            src.util.save(
+                encoder,
+                optimizer,
+                scheduler,
+                step,
+                best_dev_em,
+                opt,
+                checkpoint_path,
+                f"epoch-{epoch}-fidmodel",
+            )
+            src.util.save(
+                model,
+                optimizer,
+                scheduler,
+                step,
+                best_dev_em,
+                opt,
+                checkpoint_path,
+                f"epoch-{epoch}-gptmodel",
+            )
 
 
-def evaluate(model, encoder, dataset, day_collator, opt, epoch):
+def evaluate(
+    model, encoder, dataset, day_collator, opt, epoch, mc_classifier, tf_classifier
+):
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(
         dataset,
@@ -163,17 +174,8 @@ def evaluate(model, encoder, dataset, day_collator, opt, epoch):
     model.eval()
 
     total_loss = 0.0
-    em_tf, em_mc, em_re = [], [], []
-    exactmatch = []
-    crowd_em_tf, crowd_em_mc, crowd_em_re = [], [], []
-    crowd_exactmatch = []
-    my_preds_tf, my_preds_mc, my_preds_re = [], [], []
-    time0 = time.time()
-    device = torch.device("cpu")
-    raw_logits = []
     with torch.no_grad():
         for batch in dataloader:
-            step += 1
             categories = []
             questions = []
             answers = []
@@ -201,25 +203,16 @@ def evaluate(model, encoder, dataset, day_collator, opt, epoch):
 
             mc_logits = mc_classifier(hidden_state)[categories == 0]
             tf_logits = tf_classifier(hidden_state)[categories == 1]
-            # re_logits = regressor(hidden_state)[categories == 2]
-            # re_logits = re_logits.squeeze(-1)
-
-            tf_probs = F.softmax(tf_logits, dim=-1)[..., 0]
-
-            re_results = regressor(hidden_state).squeeze(-1)[categories == 2, ...]
 
             mc_labels = crowd_forecasts[categories == 0, :, :]
             tf_labels = crowd_forecasts[categories == 1, :, 0]
-            # re_labels = crowd_forecasts[categories == 2, :, 0]
             mc_mask = mask[categories == 0]
             tf_mask = mask[categories == 1]
-            # re_mask = mask[categories == 2]
-            
+
             total_loss_mc = 0
             total_loss_tf = 0
-            total_loss_num = 0
             if len(mc_labels) > 0:
-                mc_logprobs = -nn.LogSoftmax(dim=2)(tf_logits)
+                mc_logprobs = -nn.LogSoftmax(dim=2)(mc_logits)
                 losses_mc = (mc_logprobs * mc_labels).sum(dim=2)
                 total_loss_mc = (losses_mc * mc_mask).sum()
             if len(tf_labels) > 0:
@@ -228,11 +221,8 @@ def evaluate(model, encoder, dataset, day_collator, opt, epoch):
                 losses_false = (1 - tf_labels) * tf_logprobs[:, :, 1]
                 losses_tf = losses_true + losses_false
                 total_loss_tf = (losses_tf * tf_mask).sum()
-            # if len(re_labels) > 0:
-            #     losses_num = nn.MSELoss(reduction="none")(re_results, re_labels)
-            #     total_loss_num = (losses_num * re_mask).sum()
 
-            train_loss = (total_loss_mc + total_loss_tf + total_loss_num) / mask.sum()  # TODO: re-weigh?
+            train_loss = (total_loss_mc + total_loss_tf) / mask.sum()
             total_loss += train_loss.item()
 
 
@@ -245,15 +235,16 @@ class ForecastingDataset:
 
     def __init__(
         self,
-        questions,
-        crowd,
-        schedule,
-        corpus,
-        max_days=128,
-        n_context=None,
+        questions: pd.DataFrame,
+        corpus: pd.DataFrame,
+        crowd: Dict[QuestionID, Iterable[float]],
+        reading: Dict[QuestionID, List[DocID]],
+        max_choice: int = 12,
+        max_days: int = 128,
+        n_context: int = 2,
     ):
-        self.schedule = schedule
-        self.questions = questions.loc[schedule.keys(), :]
+        self.reading = reading
+        self.questions = questions
         self.crowd = crowd
         self.corpus = corpus
         self.max_days = max_days
@@ -262,48 +253,39 @@ class ForecastingDataset:
     def __len__(self):
         return len(self.questions)
 
-    def __getitem__(self, index):
-        question_data = self.questions.iloc[index, :]
-        question_id = question_data.name
-        schedule = self.schedule.get(question_id)
-        crowd = self.crowd.get(question_id)
-        schedule = pd.DataFrame(schedule).set_index("date")
-        crowd = pd.DataFrame.from_dict(crowd, orient="index")
-        schedule.index = pd.to_datetime(schedule.index)
-        crowd.index = pd.to_datetime(crowd.index)
-        active_dates = crowd.index.intersection(schedule.index)
-        active_dates = active_dates.sort_values(ascending=False)[: self.max_days]
-        schedule = schedule.loc[active_dates, :]
-        crowd = crowd.loc[active_dates, :]
-        research_materal = self.corpus.loc[schedule["doc_id"], :]
-        answer = question_data.get("answer")
-        qtype = question_data.get("qtype")
+    def __getitem__(self, index: int):
+        question_data = self.questions.iloc[index]
+        question_id: QuestionID = question_data.name
+        answer = question_data["answer"]
+        qtype = question_data["qtype"]
         if qtype == "mc":
             category = 0
-            answer = bool(answer)
-        elif qtype == "t/f":
-            category = 1
             answer = int(answer)
-        elif qtype == "num":
-            category = 2
+            label = answer
+        else:
+            category = 1
+            answer = bool(answer)
+            label = max_choices + answer
 
-        crowd = torch.tensor(crowd.to_numpy())
-
-        # Pad targets to be n x max_choice_len
-        crowd_padded = torch.full((crowd.size(0), max_choices), -1.0)
+        doc_ids = self.reading[question_id]
+        crowd = self.crowd[question_id]
+        reading = self.corpus.loc[doc_ids, :]
+        crowd = torch.tensor(crowd)
+        crowd_padded = torch.zeros(crowd.size(0), max_choices)
         crowd_padded[: crowd.size(0), : crowd.size(1)] = crowd
+        crowd_padded = crowd_padded[-self.max_days :]
 
         question = ForecastingQuestion(
             question_data,
-            schedule,
-            research_materal,
+            reading,
+            label,
             self.n_context,
-            max_choices,
+            self.max_days,
         )
         return category, question, answer, crowd_padded
 
 
-def encode_question(model, dataset, opt, collator, mode):
+def encode_question(model, dataset, opt, collator, mode="train"):
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(
         dataset, sampler=sampler, batch_size=16, drop_last=False, collate_fn=collator
@@ -330,7 +312,7 @@ def encode_question(model, dataset, opt, collator, mode):
             )
         outputs.append(model_output.decoder_hidden_states[-1])
 
-    outputs = torch.cat(outputs, dim=0)  # (n_examples, 1, hidden_size)
+    outputs = torch.cat(outputs, dim=0)
     outputs = outputs.view(outputs.shape[0], -1)  # (n_examples, hidden_size)
 
     if mode == "eval":
@@ -387,14 +369,12 @@ if __name__ == "__main__":
 
     logger = src.util.init_logger(opt.is_main, opt.is_distributed, log_path)
 
-    model_name = "t5-" + opt.model_size
+    model_name: str = "t5-" + opt.model_size
     model_class = src.model.FiDT5
 
     # load data
     tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
-    fid_collator = src.forecasting_data_multihead.Collator(
-        opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength
-    )
+    fid_collator = Collator(opt.text_maxlength, tokenizer, opt.answer_maxlength)
 
     if opt.model_path:
         checkpoint_path = Path(script_dir) / "checkpoint" / opt.model_path
@@ -407,7 +387,7 @@ if __name__ == "__main__":
         )
         logger.info(f"Model loaded from {checkpoint_path}")
     else:
-        t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
+        t5 = T5ForConditionalGeneration.from_pretrained("t5-Small")
         model = src.model.FiDT5(t5.config)
         model.load_t5(t5.state_dict())
         model = model.to(opt.local_rank)
@@ -432,37 +412,35 @@ if __name__ == "__main__":
     # Load training data.
     train_questions_path = os.path.join(script_dir, opt.train_questions)
     train_crowd_path = os.path.join(script_dir, opt.train_crowd)
-    train_schedule_path = os.path.join(script_dir, opt.train_schedule)
-
+    train_reading_path = os.path.join(script_dir, opt.train_schedule)
     train_questions = pd.read_json(train_questions_path, orient="index")
     with open(train_crowd_path, "r") as datafile:
         train_crowd = json.load(datafile)
-    with open(train_schedule_path, "r") as datafile:
-        train_schedule = json.load(datafile)
-
+    with open(train_reading_path, "r") as datafile:
+        train_reading = json.load(datafile)
     train_dataset = ForecastingDataset(
         train_questions,
-        train_crowd,
-        train_schedule,
         corpus,
+        train_crowd,
+        train_reading,
         max_days=opt.max_seq_len,
         n_context=opt.n_context,
     )
+
+    # Load test data.
     test_questions_path = os.path.join(script_dir, opt.test_questions)
     test_crowd_path = os.path.join(script_dir, opt.test_crowd)
-    test_schedule_path = os.path.join(script_dir, opt.test_schedule)
-
+    test_reading_path = os.path.join(script_dir, opt.test_schedule)
     test_questions = pd.read_json(test_questions_path, orient="index")
+    with open(test_reading_path, "r") as datafile:
+        test_reading = json.load(datafile)
     with open(test_crowd_path, "r") as datafile:
         test_crowd = json.load(datafile)
-    with open(test_schedule_path, "r") as datafile:
-        test_schedule = json.load(datafile)
-
     eval_dataset = ForecastingDataset(
         test_questions,
-        test_crowd,
-        test_schedule,
         corpus,
+        test_crowd,
+        test_reading,
         max_days=opt.max_seq_len,
         n_context=opt.n_context,
     )
@@ -479,7 +457,7 @@ if __name__ == "__main__":
         fid_hidden_size = 1024
         gpt_hidden_size = 1280
         gpt_model_name += "-large"
-    elif opt.model_size == "3b":
+    else:
         fid_hidden_size = 1024
         gpt_hidden_size = 1600
         gpt_model_name += "-xl"
@@ -506,12 +484,12 @@ if __name__ == "__main__":
         model,
         optimizer,
         scheduler,
-        all_params,
-        step,
         train_dataset,
-        eval_dataset,
         opt,
         fid_collator,
         best_dev_em,
         checkpoint_path,
+        mc_classifier,
+        tf_classifier,
+        all_params,
     )
