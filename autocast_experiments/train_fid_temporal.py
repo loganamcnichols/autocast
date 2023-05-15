@@ -91,15 +91,15 @@ def train(
 
             mc_logits = mc_classifier(hidden_state)[categories == 0]
             tf_logits = tf_classifier(hidden_state)[categories == 1]
-            re_logits = regressor(hidden_state)[categories == 2]
-            re_logits = re_logits.squeeze(-1)
+            # re_logits = regressor(hidden_state)[categories == 2]
+            # re_logits = re_logits.squeeze(-1)
 
             mc_labels = crowd_forecasts[categories == 0, :, :]
             tf_labels = crowd_forecasts[categories == 1, :, 0]
             re_labels = crowd_forecasts[categories == 2, :, 0]
             mc_mask = mask[categories == 0]
             tf_mask = mask[categories == 1]
-            re_mask = mask[categories == 2]
+            # re_mask = mask[categories == 2]
 
             total_loss_mc = 0
             total_loss_tf = 0
@@ -114,9 +114,9 @@ def train(
                 losses_false = (1 - tf_labels) * tf_logprobs[:, :, 1]
                 losses_tf = losses_true + losses_false
                 total_loss_tf = (losses_tf * tf_mask).sum()
-            if len(re_labels) > 0:
-                losses_num = nn.MSELoss(reduction="none")(re_logits, re_labels)
-                total_loss_num = (losses_num * re_mask).sum()
+            # if len(re_labels) > 0:
+            #     losses_num = nn.MSELoss(reduction="none")(re_logits, re_labels)
+            #     total_loss_num = (losses_num * re_mask).sum()
 
             train_loss = (total_loss_mc + total_loss_tf + total_loss_num) / mask.sum()  # TODO: re-weigh?
 
@@ -196,14 +196,13 @@ def evaluate(model, encoder, dataset, day_collator, opt, epoch):
             mask = (crowd_forecasts == -1).all(dim=2)
             categories = torch.tensor(categories, device=mask.device)
             answers = torch.tensor(answers, device=mask.device)
-            seq_lengths = mask.sum(dim=1)
 
             hidden_state = model(questions, mask=mask)
 
             mc_logits = mc_classifier(hidden_state)[categories == 0]
             tf_logits = tf_classifier(hidden_state)[categories == 1]
-            re_logits = regressor(hidden_state)[categories == 2]
-            re_logits = re_logits.squeeze(-1)
+            # re_logits = regressor(hidden_state)[categories == 2]
+            # re_logits = re_logits.squeeze(-1)
 
             tf_probs = F.softmax(tf_logits, dim=-1)[..., 0]
 
@@ -211,24 +210,11 @@ def evaluate(model, encoder, dataset, day_collator, opt, epoch):
 
             mc_labels = crowd_forecasts[categories == 0, :, :]
             tf_labels = crowd_forecasts[categories == 1, :, 0]
-            re_labels = crowd_forecasts[categories == 2, :, 0]
+            # re_labels = crowd_forecasts[categories == 2, :, 0]
             mc_mask = mask[categories == 0]
             tf_mask = mask[categories == 1]
-            re_mask = mask[categories == 2]
-            mc_mask_indi = mc_labels >= 0.0
+            # re_mask = mask[categories == 2]
             
-
-            batch_loss, loss_mc, loss_re = (
-                torch.tensor(0.0).cuda(),
-                torch.tensor(0.0).cuda(),
-                torch.tensor(0.0).cuda(),
-            )
-            size_tf, size_mc, size_re = (
-                tf_mask.sum().item(),
-                mc_mask.sum().item(),
-                re_mask.sum().item(),
-            )
-
             total_loss_mc = 0
             total_loss_tf = 0
             total_loss_num = 0
@@ -242,125 +228,12 @@ def evaluate(model, encoder, dataset, day_collator, opt, epoch):
                 losses_false = (1 - tf_labels) * tf_logprobs[:, :, 1]
                 losses_tf = losses_true + losses_false
                 total_loss_tf = (losses_tf * tf_mask).sum()
-            if len(re_labels) > 0:
-                losses_num = nn.MSELoss(reduction="none")(re_results, re_labels)
-                total_loss_num = (losses_num * re_mask).sum()
+            # if len(re_labels) > 0:
+            #     losses_num = nn.MSELoss(reduction="none")(re_results, re_labels)
+            #     total_loss_num = (losses_num * re_mask).sum()
 
             train_loss = (total_loss_mc + total_loss_tf + total_loss_num) / mask.sum()  # TODO: re-weigh?
             total_loss += train_loss.item()
-
-            seq_ends_indices_tf = seq_ends[categories == 0].unsqueeze(-1)
-            seq_ends_indices_mc = seq_ends[categories == 1].unsqueeze(-1)
-            seq_ends_expand = seq_ends_indices_mc.expand(
-                -1, mc_labels.size()[-1]
-            ).unsqueeze(1)
-            seq_ends_indices_re = seq_ends[categories == 2].unsqueeze(-1)
-
-            true_labels_tf = answers[categories == 0]
-            true_labels_mc = answers[categories == 1]
-            true_labels_re = answers[categories == 2]
-
-            if len(true_labels_tf) > 0:
-                crowd_preds_tf = (
-                    torch.gather(tf_labels.squeeze(-1), -1, seq_ends_indices_tf).view(
-                        -1
-                    )
-                    > 0.5
-                )
-                preds_tf = (
-                    torch.gather(tf_probs, -1, seq_ends_indices_tf).view(-1) > 0.5
-                )
-            else:
-                crowd_preds_tf = torch.tensor([], device=true_labels_tf.device)
-                preds_tf = torch.tensor([], device=true_labels_tf.device)
-
-            if len(true_labels_mc) > 0:
-                crowd_preds_mc = torch.argmax(
-                    torch.gather(mc_labels, 1, seq_ends_expand).squeeze(1), dim=-1
-                )
-                preds_mc = torch.argmax(
-                    torch.gather(mc_logits, 1, seq_ends_expand).squeeze(1), dim=-1
-                )
-            else:
-                crowd_preds_mc = torch.tensor([], device=true_labels_mc.device)
-                preds_mc = torch.tensor([], device=true_labels_mc.device)
-
-            if len(true_labels_re) > 0:
-                crowd_preds_re = torch.gather(re_labels, -1, seq_ends_indices_re).view(
-                    -1
-                )
-                preds_re = torch.gather(re_results, -1, seq_ends_indices_re).view(-1)
-            else:
-                crowd_preds_re = torch.tensor([], device=true_labels_re.device)
-                preds_re = torch.tensor([], device=true_labels_re.device)
-
-            crowd_em_tf.extend(
-                (true_labels_tf == crowd_preds_tf).detach().cpu().numpy()
-            )
-            em_tf.extend((true_labels_tf == preds_tf).detach().cpu().numpy())
-            crowd_em_mc.extend(
-                (true_labels_mc == crowd_preds_mc).detach().cpu().numpy()
-            )
-            em_mc.extend((true_labels_mc == preds_mc).detach().cpu().numpy())
-            crowd_em_re.extend(
-                -torch.abs(true_labels_re - crowd_preds_re).detach().cpu().numpy()
-            )
-            em_re.extend(-torch.abs(true_labels_re - preds_re).detach().cpu().numpy())
-
-            my_preds_tf.extend(preds_tf.detach().cpu().numpy())
-            my_preds_mc.extend(preds_mc.detach().cpu().numpy())
-            my_preds_re.extend(preds_re.detach().cpu().numpy())
-
-            tf_count, mc_count, re_count = 0, 0, 0
-            seq_ends = seq_ends.detach().to(device).numpy() + 1
-            tf_logits = tf_logits.detach().to(device).numpy()
-            mc_logits = mc_logits.detach().to(device).numpy()
-            re_results = re_results.detach().to(device).numpy()
-            for i, cat in enumerate(categories):
-                if cat == 0:
-                    raw_logits.append(tf_logits[tf_count][: seq_ends[i]])
-                    tf_count += 1
-                elif cat == 1:
-                    raw_logits.append(mc_logits[mc_count][: seq_ends[i]])
-                    mc_count += 1
-                elif cat == 2:
-                    raw_logits.append(re_results[re_count][: seq_ends[i]])
-                    re_count += 1
-
-    # out-of-order overall stats
-    crowd_exactmatch = crowd_em_tf + crowd_em_mc + crowd_em_re
-    exactmatch = em_tf + em_mc + em_re
-
-    if not checkpoint_path.exists():
-        checkpoint_path.mkdir()
-    outpath = checkpoint_path / f"results_epoch{epoch}.obj"
-    with open(outpath, "wb") as f:
-        pickle.dump(raw_logits, f)
-
-    if len(em_tf) == 0:
-        logger.info(f"EVAL:  For T/F: Predicted N/A")
-    else:
-        logger.info(
-            f"EVAL:  For T/F: Predicted {em_tf.count(1)} Match {em_tf.count(0)} Wrong \
-        ({my_preds_tf.count(1)} YES {my_preds_tf.count(0)} NO) | EM: {round(em_tf.count(1) / len(em_tf) * 100, 2)}"
-        )
-    if len(em_mc) == 0:
-        logger.info(f"       For MC:  Predicted N/A")
-    else:
-        logger.info(
-            f"       For MC:  Predicted {em_mc.count(1)} Match {em_mc.count(0)} Wrong | \
-        EM: {round(em_mc.count(1) / len(em_mc) * 100, 2)}"
-        )
-    if len(em_re) == 0:
-        logger.info(f"       For Reg: Predicted N/A")
-    else:
-        logger.info(f"       For Reg: Predicted Dist {np.mean(em_re)}")
-    logger.info(f"{int(time.time() - time0)} sec")
-
-    exactmatch, test_loss = src.util.weighted_average(
-        np.mean(exactmatch) / 2, total_loss / len(dataloader), opt
-    )
-    return exactmatch, test_loss, np.mean(crowd_exactmatch) / 2
 
 
 class ForecastingDataset:
