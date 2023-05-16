@@ -37,7 +37,7 @@ Visit http://aws.amazon.com/contact-us/ec2-request. In Request 1, specify the re
 2. Install the Remote - SSH extension.
 3. Click the Remote Explorer icon in the extensions bar on the left.
 4. In Remote > SSH on the right, click the (+).
-5. Visit console.aws.amazon.com/ec2, go to instances, select your instance, and click connect.
+5. Visit https://console.aws.amazon.com/ec2/, go to instances, select your instance, and click connect.
 6. Navigate to SSH client and copy the example connect command.
 7. Paste the command into the VS Code bar, replace the quoted ssh file with the full path to the ssh file, and press enter.
 8. For the config file to edit, choose the default. The file will auto-populate with the correct configuration.
