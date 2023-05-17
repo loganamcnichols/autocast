@@ -1,5 +1,6 @@
 import json
 import os
+import numpy as np
 import pytz
 from dateutil import parser
 import pandas as pd
@@ -50,8 +51,8 @@ for question in questions:
         question["choices"] = ["num"]
         question["answer"] = float(question["answer"])
     elif question.get("qtype") == "t/f":
-        question["choices"] = ["yes"]
-        question["answer"] = question["answer"] == "yes"
+        question["choices"] = ["no", "yes"]
+        question["answer"] = int(question["answer"] == "yes")
     elif question.get("qtype") == "mc":
         question["answer"] = ord(question["answer"]) - ord("A")
 
@@ -71,7 +72,10 @@ for question in questions:
         [forecast["timestamp"] for forecast in forecasts],
         format="ISO8601",
     )
-    data = [forecast["forecast"] for forecast in forecasts]
+    data = np.array([forecast["forecast"] for forecast in forecasts])
+    if question["qtype"] == "t/f":
+        data = data.reshape((-1, 1))
+        data = np.concatenate([(1 - data), data], axis=1)
     crowd_forecast = (
         pd.DataFrame(
             data=data,

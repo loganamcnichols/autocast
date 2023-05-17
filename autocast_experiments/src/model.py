@@ -56,7 +56,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         )
 
     # To get the decoder hidden state output for forecasting
-    def reset_head_to_identity(self):
+    def reset_head_to_identity(self) -> None:
         self.lm_head = nn.Identity(self.model_dim)
 
     def wrap_encoder(self, use_checkpoint=False):

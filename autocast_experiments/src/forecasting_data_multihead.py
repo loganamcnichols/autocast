@@ -64,7 +64,7 @@ class ForecastingQuestion(Dataset):
         docs = self.research_material.loc[self.research_material["date"] <= date]
         doc_str = ""
         if docs.shape[0] > 0:
-            docs = docs.sample(n=self.n_context, random_state=42, replace=True)
+            docs = docs.sample(n=self.n_context, replace=True)
             publish_dates = docs["date"].dt.strftime("%Y-%m-%d")
             docs = (
                 "Title: "

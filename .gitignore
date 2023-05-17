@@ -6,3 +6,4 @@ __pycache__/
 test.py
 *.obj
 runs/*
+*.pdf
